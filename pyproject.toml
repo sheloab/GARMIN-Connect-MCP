@@ -1,11 +1,11 @@
 [project]
 name = "mcp-garmin-connect"
 version = "0.2.0"
-description = "LLM-agnostic MCP server for Garmin Connect data, with optional provider demo agents."
+description = "GARMIN Connect MCP: LLM-agnostic MCP server for Garmin Connect sleep, recovery, training and running data."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "kavakoss" }]
+authors = [{ name = "kavakoss" }, { name = "sheloab" }]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -25,7 +25,6 @@ keywords = [
     "model-context-protocol",
     "deepseek",
     "openai",
-    "claude",
     "openrouter",
     "gemini",
     "fitness",
@@ -40,10 +39,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/kavakoss/mcp-garmin-connect"
-Repository = "https://github.com/kavakoss/mcp-garmin-connect"
-Issues = "https://github.com/kavakoss/mcp-garmin-connect/issues"
-Changelog = "https://github.com/kavakoss/mcp-garmin-connect/releases"
+Homepage = "https://github.com/sheloab/GARMIN-Connect-MCP"
+Repository = "https://github.com/sheloab/GARMIN-Connect-MCP"
+Issues = "https://github.com/sheloab/GARMIN-Connect-MCP/issues"
+Changelog = "https://github.com/sheloab/GARMIN-Connect-MCP/releases"
 
 [project.scripts]
 garmin-mcp = "mcp_garmin_connect.cli:main"

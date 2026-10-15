@@ -1,6 +1,6 @@
 # MCP Client Setup Examples
 
-These examples show common ways to connect MCP clients to `mcp-garmin-connect`.
+These examples show common ways to connect MCP clients to GARMIN Connect MCP.
 Client config formats change over time, so treat them as starting points and adapt
 to your client version.
 
@@ -15,7 +15,7 @@ to your client version.
       "command": "uv",
       "args": [
         "--directory",
-        "C:\\path\\to\\mcp-garmin-connect",
+        "C:\\path\\to\\GARMIN-Connect-MCP",
         "run",
         "garmin-mcp",
         "serve",
@@ -41,15 +41,10 @@ Then point HTTP-capable clients at:
 http://127.0.0.1:8765/mcp
 ```
 
-## Claude Desktop
+## Desktop and CLI clients with `mcpServers` config
 
-Add the `garmin` entry under `mcpServers` in Claude Desktop's config file. Use
-the stdio JSON above, then fully restart Claude Desktop.
-
-## Claude Code
-
-Use a local stdio MCP server entry. If configuring manually, use the same command
-and args from the stdio example.
+Add the `garmin` entry under `mcpServers` in the client's MCP config file. Use
+the stdio JSON above, then restart the client.
 
 ## Cursor
 
@@ -71,7 +66,7 @@ mcp_servers:
     command: "uv"
     args:
       - "--directory"
-      - "C:\\path\\to\\mcp-garmin-connect"
+      - "C:\\path\\to\\GARMIN-Connect-MCP"
       - "run"
       - "garmin-mcp"
       - "serve"
@@ -81,7 +76,7 @@ mcp_servers:
 ```
 
 Configure Hermes' LLM provider separately, for example DeepSeek, OpenAI, or
-Claude. MCP provides Garmin tools; the LLM provider performs the reasoning.
+Gemini. MCP provides Garmin tools; the LLM provider performs the reasoning.
 
 ## Generic Provider Demo
 
@@ -90,7 +85,7 @@ For clients without native MCP support, use the built-in bridge:
 ```powershell
 uv run garmin-mcp ask "How is my recovery today?" --provider deepseek --allow-external-health-data
 uv run garmin-mcp ask "How is my recovery today?" --provider openai --allow-external-health-data
-uv run garmin-mcp ask "How is my recovery today?" --provider claude --allow-external-health-data
+uv run garmin-mcp ask "How is my recovery today?" --provider gemini --allow-external-health-data
 ```
 
 The `--allow-external-health-data` flag is required because tool results can send

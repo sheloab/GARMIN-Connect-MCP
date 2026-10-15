@@ -23,11 +23,11 @@
   <circle cx="1160" cy="40" r="120" fill="none" stroke="#38bdf8" stroke-opacity="0.12" stroke-width="1.5"/>
   <circle cx="1160" cy="40" r="160" fill="none" stroke="#38bdf8" stroke-opacity="0.07" stroke-width="1.5"/>
 
-  <text x="72" y="118" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="58" font-weight="700" fill="#f8fafc">mcp-garmin-connect</text>
+  <text x="72" y="118" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="58" font-weight="700" fill="#f8fafc">GARMIN Connect MCP</text>
   <text x="72" y="168" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="26" fill="#94a3b8">LLM-agnostic MCP server for Garmin Connect</text>
 
   <rect x="72" y="205" rx="999" ry="999" width="150" height="40" fill="#0f2438" stroke="#38bdf8" stroke-opacity="0.35"/>
-  <text x="147" y="231" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="17" fill="#7dd3fc">15 tools</text>
+  <text x="147" y="231" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="17" fill="#7dd3fc">26 tools</text>
 
   <rect x="238" y="205" rx="999" ry="999" width="170" height="40" fill="#0f2438" stroke="#22c55e" stroke-opacity="0.35"/>
   <text x="323" y="231" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="17" fill="#86efac">4 prompts</text>

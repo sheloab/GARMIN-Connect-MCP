@@ -131,66 +131,6 @@ class OpenAICompatibleAgent(BaseToolCallingAgent):
         )
 
 
-class ClaudeAgent(BaseToolCallingAgent):
-    provider_name = "claude"
-
-    def default_model(self) -> str:
-        return self.settings.anthropic_model
-
-    def _ask(self, question: str, max_tool_rounds: int) -> AgentResult:
-        api_key = self.settings.require_provider_key("claude")
-        messages: list[dict[str, Any]] = [{"role": "user", "content": question}]
-        tool_calls_seen: list[str] = []
-
-        with httpx.Client(
-            base_url=self.settings.anthropic_base_url.rstrip("/"),
-            timeout=120,
-        ) as client:
-            for _ in range(max_tool_rounds + 1):
-                payload = {
-                    "model": self.model,
-                    "max_tokens": 2048,
-                    "system": SYSTEM_PROMPT,
-                    "messages": messages,
-                    "tools": claude_tools(),
-                }
-                response = client.post(
-                    "/v1/messages",
-                    headers={
-                        "x-api-key": api_key,
-                        "anthropic-version": "2023-06-01",
-                    },
-                    json=payload,
-                )
-                response.raise_for_status()
-                message = response.json()
-                content = message.get("content") or []
-                tool_uses = [block for block in content if block.get("type") == "tool_use"]
-                if not tool_uses:
-                    return AgentResult(answer=_claude_text(content), tool_calls=tool_calls_seen)
-
-                messages.append({"role": "assistant", "content": content})
-                tool_results = []
-                for block in tool_uses:
-                    name = block.get("name")
-                    tool_input = block.get("input")
-                    result = call_tool(name, tool_input if isinstance(tool_input, dict) else {})
-                    tool_calls_seen.append(name or "unknown")
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.get("id"),
-                            "content": json.dumps(result, ensure_ascii=False, default=str),
-                        }
-                    )
-                messages.append({"role": "user", "content": tool_results})
-
-        return AgentResult(
-            answer="The model kept requesting tools and hit the configured tool-round limit.",
-            tool_calls=tool_calls_seen,
-        )
-
-
 class GeminiAgent(BaseToolCallingAgent):
     provider_name = "gemini"
 
@@ -313,8 +253,6 @@ def create_agent(
         return DeepSeekAgent(settings=settings, model=model)
     if provider_key == "openai":
         return OpenAIAgent(settings=settings, model=model)
-    if provider_key == "claude":
-        return ClaudeAgent(settings=settings, model=model)
     if provider_key == "openrouter":
         return OpenRouterAgent(settings=settings, model=model)
     if provider_key == "gemini":
@@ -337,12 +275,6 @@ def provider_specs(settings: Settings | None = None) -> dict[str, ProviderSpec]:
             api_key_configured=bool(settings.openai_api_key),
             base_url=settings.openai_base_url,
         ),
-        "claude": ProviderSpec(
-            name="claude",
-            default_model=settings.anthropic_model,
-            api_key_configured=bool(settings.anthropic_api_key),
-            base_url=settings.anthropic_base_url,
-        ),
         "openrouter": ProviderSpec(
             name="openrouter",
             default_model=settings.openrouter_model,
@@ -359,7 +291,7 @@ def provider_specs(settings: Settings | None = None) -> dict[str, ProviderSpec]:
 
 
 def supported_providers() -> list[str]:
-    return ["deepseek", "openai", "claude", "openrouter", "gemini"]
+    return ["deepseek", "openai", "openrouter", "gemini"]
 
 
 def openai_compatible_tools() -> list[dict[str, Any]]:
@@ -371,17 +303,6 @@ def openai_compatible_tools() -> list[dict[str, Any]]:
                 "description": spec.description,
                 "parameters": tool_schema(spec),
             },
-        }
-        for spec in TOOL_SPECS
-    ]
-
-
-def claude_tools() -> list[dict[str, Any]]:
-    return [
-        {
-            "name": spec.name,
-            "description": spec.description,
-            "input_schema": tool_schema(spec),
         }
         for spec in TOOL_SPECS
     ]
@@ -421,11 +342,6 @@ def call_tool(name: str | None, args: dict[str, Any]) -> dict[str, Any]:
         return TOOLS_BY_NAME[name].function(**args)
     except Exception as exc:
         return {"error": f"{type(exc).__name__}: {exc}"}
-
-
-def _claude_text(content: list[dict[str, Any]]) -> str:
-    parts = [block.get("text", "") for block in content if block.get("type") == "text"]
-    return "\n".join(part for part in parts if part).strip()
 
 
 def _gemini_content(payload: dict[str, Any]) -> dict[str, Any]:

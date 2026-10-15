@@ -38,9 +38,6 @@ class Settings:
     openai_api_key: str | None
     openai_base_url: str
     openai_model: str
-    anthropic_api_key: str | None
-    anthropic_base_url: str
-    anthropic_model: str
     openrouter_api_key: str | None
     openrouter_base_url: str
     openrouter_model: str
@@ -66,9 +63,6 @@ class Settings:
             openai_api_key=os.getenv("OPENAI_API_KEY"),
             openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-5"),
-            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
-            anthropic_base_url=os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
-            anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5"),
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
             openrouter_base_url=os.getenv(
                 "OPENROUTER_BASE_URL",
@@ -99,14 +93,12 @@ class Settings:
         env_name_by_provider = {
             "deepseek": "DEEPSEEK_API_KEY",
             "openai": "OPENAI_API_KEY",
-            "claude": "ANTHROPIC_API_KEY",
             "openrouter": "OPENROUTER_API_KEY",
             "gemini": "GEMINI_API_KEY",
         }
         key_by_provider = {
             "deepseek": self.deepseek_api_key,
             "openai": self.openai_api_key,
-            "claude": self.anthropic_api_key,
             "openrouter": self.openrouter_api_key,
             "gemini": self.gemini_api_key,
         }

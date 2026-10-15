@@ -90,7 +90,6 @@ def _doctor(include_live: bool) -> None:
             "token-cache",
             "deepseek-key",
             "openai-key",
-            "claude-key",
             "openrouter-key",
             "gemini-key",
         }
