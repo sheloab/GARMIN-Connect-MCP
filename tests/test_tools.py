@@ -11,12 +11,18 @@ from mcp_garmin_connect.tools import (
     TOOL_SPECS,
     _hr_drift,
     get_activity_splits,
+    get_body_battery,
+    get_daily_activity,
     get_monthly_running_stats,
+    get_performance_metrics,
     get_personal_records,
     get_recent_activities,
     get_recent_load,
     get_resting_heart_rate,
     get_running_summary,
+    get_running_tolerance,
+    get_sleep,
+    get_training_readiness_history,
     get_zones,
     tool_schema,
 )
@@ -75,6 +81,133 @@ class FakeGarmin:
                 }
             }
         }
+
+    def get_sleep_data(self, cdate: str) -> dict[str, Any]:
+        dto: dict[str, Any] = {
+            "calendarDate": cdate,
+            "sleepTimeSeconds": 24480,
+            "napTimeSeconds": 1500,
+            "sleepStartTimestampLocal": 1893537000000,
+            "sleepEndTimestampLocal": 1893563280000,
+            "deepSleepSeconds": 6000,
+            "lightSleepSeconds": 13680,
+            "remSleepSeconds": 4800,
+            "awakeSleepSeconds": 600,
+            "averageSpO2Value": 96.0,
+            "lowestSpO2Value": 90,
+            "averageRespirationValue": 14.0,
+            "awakeCount": 1,
+            "avgSleepStress": 15.0,
+            "avgHeartRate": 52.0,
+            "sleepScoreFeedback": "POSITIVE_DEEP",
+            "sleepScores": {
+                "overall": {"value": 80, "qualifierKey": "GOOD"},
+                "remPercentage": {"value": 20, "qualifierKey": "GOOD"},
+                "awakeCount": {"qualifierKey": "EXCELLENT"},
+            },
+            "sleepNeed": {
+                "actual": 450,
+                "baseline": 450,
+                "recommendedBedtimeStartMins": 1350,
+                "recommendedBedtimeEndMins": 1380,
+            },
+            "nextSleepNeed": {"calendarDate": "next", "actual": 480, "napAdjustment": "DECREASING"},
+            "dailyNapDTOS": [
+                {
+                    "napTimeSec": 1500,
+                    "napStartTimestampGMT": "2030-01-02T12:10:00",
+                    "napEndTimestampGMT": "2030-01-02T12:35:00",
+                    "napStartTimeOffset": 60,
+                    "napEndTimeOffset": 60,
+                    "napFeedback": "IDEAL_TIMING_IDEAL_DURATION_LOW_NEED",
+                }
+            ],
+        }
+        return {
+            "dailySleepDTO": dto,
+            "avgOvernightHrv": 60.0,
+            "hrvStatus": "BALANCED",
+            "restingHeartRate": 50,
+            "restlessMomentsCount": 15,
+            "bodyBatteryChange": 70,
+            "avgSkinTempDeviationC": 0.1,
+        }
+
+    def get_user_summary(self, cdate: str) -> dict[str, Any]:
+        return {
+            "totalSteps": 12000,
+            "dailyStepGoal": 10000,
+            "totalDistanceMeters": 9500,
+            "floorsAscended": 3.4,
+            "moderateIntensityMinutes": 10,
+            "vigorousIntensityMinutes": 20,
+            "sedentarySeconds": 36000,
+            "bodyBatteryAtWakeTime": 90,
+            "bodyBatteryDuringSleep": 70,
+            "bodyBatteryActivityEventList": [
+                {
+                    "eventType": "SLEEP",
+                    "eventStartTimeGmt": "2030-01-01T21:30:00",
+                    "timezoneOffset": 3600000,
+                    "durationInMilliseconds": 27000000,
+                    "bodyBatteryImpact": 70,
+                }
+            ],
+        }
+
+    def get_weekly_intensity_minutes(self, start: str, end: str) -> list[dict[str, Any]]:
+        return [{"calendarDate": "2030-01-01", "weeklyGoal": 150, "moderateValue": 40,
+                 "vigorousValue": 30}]
+
+    def get_training_readiness(self, cdate: str) -> list[dict[str, Any]]:
+        return [
+            {"timestamp": "2030-01-01T05:00:00.0", "score": 55, "level": "MODERATE"},
+            {
+                "timestamp": "2030-01-01T09:00:00.0",
+                "score": 70,
+                "level": "HIGH",
+                "recoveryTime": 90,
+                "hrvFactorPercent": 100,
+                "hrvFactorFeedback": "VERY_GOOD",
+                "hrvWeeklyAverage": 58,
+            },
+        ]
+
+    def get_endurance_score(self, start: str, end: str) -> dict[str, Any]:
+        return {
+            "enduranceScoreDTO": {
+                "overallScore": 5400,
+                "classificationLowerLimitIntermediate": 5100,
+                "classificationLowerLimitTrained": 5800,
+                "classificationLowerLimitWellTrained": 6500,
+            },
+            "groupMap": {"2030-01-01": {"groupAverage": 5380, "groupMax": 5400}},
+        }
+
+    def get_hill_score(self, start: str, end: str) -> dict[str, Any]:
+        return {"hillScoreDTOList": [{"calendarDate": "2030-01-01", "overallScore": 40}]}
+
+    def get_fitnessage_data(self, cdate: str) -> dict[str, Any]:
+        return {"chronologicalAge": 40, "fitnessAge": 36.5, "components": {}}
+
+    def get_lactate_threshold(self) -> dict[str, Any]:
+        return {
+            "speed_and_heart_rate": {"speed": 0.3, "heartRate": 165},
+            "power": {"functionalThresholdPower": 350},
+        }
+
+    def get_max_metrics_range(self, start: str, end: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "generic": {"calendarDate": "2030-01-01", "vo2MaxPreciseValue": 50.1},
+                "heatAltitudeAcclimation": {"heatAcclimationPercentage": 100,
+                                            "heatTrend": "ACCLIMATIZED"},
+            }
+        ]
+
+    def get_running_tolerance(self, start: str, end: str) -> list[dict[str, Any]]:
+        return [{"startOfWeek": "2030-01-01", "totalImpactLoad": 5000, "tolerance": 20000,
+                 "totalDistance": 12000.0}]
 
     def get_activity_splits(self, activity_id: int) -> dict[str, Any]:
         if activity_id == 2:
@@ -390,6 +523,116 @@ def test_resting_heart_rate_clamps_to_30_days() -> None:
 
     assert result["period_days"] == 30
     assert len(result["daily"]) == 30
+
+
+def test_sleep_includes_naps_stages_and_vitals() -> None:
+    import mcp_garmin_connect.garmin_client as garmin_client
+
+    garmin_client._manager = FakeManager()
+
+    result = get_sleep(days=2)
+    day = result["daily"][0]
+
+    assert day["hours"] == 6.8
+    assert day["score"] == 80
+    assert day["score_rating"] == "GOOD"
+    assert day["score_factors"] == {"awake_count": "EXCELLENT"}
+    assert day["bedtime"] == "2030-01-01T22:30"
+    assert day["wake_time"] == "2030-01-02T05:48"
+    assert day["stages"]["deep"] == {"minutes": 100}
+    assert day["stages"]["rem"] == {"minutes": 80, "percent": 20, "rating": "GOOD"}
+    assert day["spo2"]["lowest"] == 90
+    assert day["overnight_hrv_ms"] == 60.0
+    assert day["sleep_need"]["hours"] == 7.5
+    assert day["sleep_need"]["recommended_bedtime"] == "22:30-23:00"
+    assert day["nap_minutes"] == 25
+    assert day["naps"] == [
+        {
+            "start": "2030-01-02T13:10",
+            "end": "2030-01-02T13:35",
+            "minutes": 25,
+            "feedback": "IDEAL_TIMING_IDEAL_DURATION_LOW_NEED",
+        }
+    ]
+    assert result["nap_count"] == 2
+    assert result["total_nap_minutes"] == 50
+    assert result["avg_rem_minutes"] == 80
+    assert result["next_sleep_need"]["hours"] == 8.0
+    assert result["next_sleep_need"]["adjustments"]["nap"] == "DECREASING"
+
+
+def test_daily_activity_and_weekly_intensity() -> None:
+    import mcp_garmin_connect.garmin_client as garmin_client
+
+    garmin_client._manager = FakeManager()
+
+    result = get_daily_activity(days=2)
+
+    assert result["total_steps"] == 24000
+    assert result["step_goal_days_met"] == 2
+    day = result["daily"][0]
+    assert day["distance_km"] == 9.5
+    assert day["floors_climbed"] == 3.4
+    assert day["activity_minutes"]["sedentary"] == 600
+    assert result["weekly_intensity_minutes"][0]["total"] == 100
+
+
+def test_body_battery_events_use_local_time() -> None:
+    import mcp_garmin_connect.garmin_client as garmin_client
+
+    garmin_client._manager = FakeManager()
+
+    day = get_body_battery(days=1)["daily"][0]
+
+    assert day["at_wake"] == 90
+    assert day["events"][0] == {
+        "type": "SLEEP",
+        "start": "2030-01-01T22:30",
+        "minutes": 450,
+        "impact": 70,
+        "feedback": None,
+        "activity_name": None,
+        "activity_id": None,
+    }
+
+
+def test_training_readiness_history_uses_latest_update() -> None:
+    import mcp_garmin_connect.garmin_client as garmin_client
+
+    garmin_client._manager = FakeManager()
+
+    day = get_training_readiness_history(days=1)["daily"][0]
+
+    assert day["score"] == 70
+    assert day["factors"]["recovery_time"]["hours"] == 1.5
+    assert day["factors"]["hrv"] == {"percent": 100, "feedback": "VERY_GOOD", "weekly_avg_ms": 58}
+
+
+def test_performance_metrics() -> None:
+    import mcp_garmin_connect.garmin_client as garmin_client
+
+    garmin_client._manager = FakeManager()
+
+    result = get_performance_metrics()
+
+    assert result["endurance_score"]["level"] == "INTERMEDIATE"
+    assert result["endurance_score"]["next_level"] == {"level": "TRAINED", "points_needed": 400}
+    assert result["hill_score"]["score"] == 40
+    assert result["lactate_threshold"]["pace_per_km"] == "5:33/km"
+    assert result["lactate_threshold"]["running_ftp_w"] == 350
+    assert result["acclimation"]["heat_percent"] == 100
+    assert result["vo2_max_trend"] == [{"date": "2030-01-01", "vo2_max": 50.1}]
+
+
+def test_running_tolerance_percent() -> None:
+    import mcp_garmin_connect.garmin_client as garmin_client
+
+    garmin_client._manager = FakeManager()
+
+    week = get_running_tolerance(weeks=1)["weekly"][0]
+
+    assert week["percent_of_tolerance"] == 25
+    assert week["distance_km"] == 12.0
 
 
 def test_tool_schemas_are_objects() -> None:
