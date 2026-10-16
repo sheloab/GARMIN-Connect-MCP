@@ -209,6 +209,33 @@ class DemoGarmin:
     def get_personal_record(self) -> dict[str, Any]:
         return {"personalRecords": list(_DEMO_PERSONAL_RECORDS)}
 
+    def get_heart_rate_zones(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "sport": "DEFAULT",
+                "trainingMethod": "HR_MAX",
+                "maxHeartRateUsed": 190,
+                "restingHeartRateUsed": 58,
+                "lactateThresholdHeartRateUsed": 166,
+                "zone1Floor": 96,
+                "zone2Floor": 125,
+                "zone3Floor": 149,
+                "zone4Floor": 163,
+                "zone5Floor": 176,
+            }
+        ]
+
+    def get_power_zones_for_sport(self, sport: str) -> dict[str, Any]:
+        return {
+            "sport": sport,
+            "functionalThresholdPower": 300.0,
+            "zone1Floor": 195.0,
+            "zone2Floor": 240.0,
+            "zone3Floor": 270.0,
+            "zone4Floor": 300.0,
+            "zone5Floor": 345.0,
+        }
+
     def connectapi(self, url: str) -> Any:
         if "personalrecordtype" in url:
             return list(_DEMO_PR_TYPES)

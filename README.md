@@ -15,12 +15,13 @@ Use the same local Garmin tools from any MCP client — Cursor, Continue, Codex 
 
 GARMIN Connect MCP is built on **[kavakoss/mcp-garmin-connect](https://github.com/kavakoss/mcp-garmin-connect)**. The original MCP server, Garmin client, caching layer, running tools, demo mode and test suite are the work of **[kavakoss](https://github.com/kavakoss)**. Huge thanks for building it and sharing it as open source under the MIT License. 🙏
 
-This project extends that foundation with richer sleep data (naps, stages, overnight vitals), 10 new tools, and activity weather plus time in HR and power zones. kavakoss's original commit history is preserved in this repository, and their original project was in turn inspired by [Jack-Abyss/claude-garmin](https://github.com/Jack-Abyss/claude-garmin).
+This project extends that foundation with richer sleep data (naps, stages, overnight vitals), 20 new tools, and activity weather plus time in HR and power zones. kavakoss's original commit history is preserved in this repository.
 
 ## What's New In This Version
 
 - **Richer `get_sleep`** — naps (time, length, Garmin feedback), deep/light/REM/awake stages with ratings, bedtime and wake time, overnight HRV, SpO2, respiration, sleep stress, Body Battery recharge, skin temperature, and Garmin's sleep need with recommended bedtime.
-- **10 new tools** — daily activity, Body Battery, daily vitals, training readiness history, performance metrics, race prediction trend, running tolerance, gear, devices, and body metrics (see [MCP Tools](#mcp-tools)).
+- **20 new tools** — per-km splits from the raw recording, run/walk/stop segments, night-by-night sleep timeline, hour-by-hour day timeline, 90-day HRV trend, 52-week trends, daily activity, Body Battery, daily vitals, training readiness history, performance metrics, race prediction trend, running tolerance, saved workouts, yearly totals, badges, gear, devices, and body metrics (see [MCP Tools](#mcp-tools)).
+- **Richer existing tools** — real HR and power zone ranges in `get_zones`, shoe usage in `get_gear`, watch alarms in `get_devices`.
 - **Richer `get_activity_detail`** — weather during the activity (°C, km/h) and minutes in each heart-rate and power zone.
 - **Fix** — `get_recovery` reports recovery time in hours (Garmin returns minutes).
 
@@ -58,7 +59,7 @@ The core server is provider-neutral. DeepSeek, OpenAI, OpenRouter, and Gemini in
 
 ## Features
 
-- **26 Garmin tools and 4 prompt templates** for training, recovery and sleep analysis.
+- **36 Garmin tools and 4 prompt templates** for training, recovery and sleep analysis.
 - **Demo mode** — `serve --demo` runs on fictional sample data with no credentials, for try-outs and recordings.
 - **Local MCP server** over `stdio` or Streamable HTTP (`/mcp`).
 - **Endpoint-level TTL cache with single-flight factories** — concurrent tool calls share one Garmin request instead of stampeding the API.
@@ -69,44 +70,116 @@ The core server is provider-neutral. DeepSeek, OpenAI, OpenRouter, and Gemini in
 - **Explicit opt-in** before Garmin health/activity data is sent to any external LLM provider.
 - **Mocked test suite** plus optional live Garmin smoke tests.
 
-## Quick Start
+## How It Works
+
+[MCP (Model Context Protocol)](https://modelcontextprotocol.io/) is an open standard that lets AI assistants call local "tools". This project is an MCP server: it runs on your own computer, logs in to Garmin Connect with your account, and exposes your data as tools your AI client can call when you ask a question.
+
+```text
+Garmin watch ──sync──▶ Garmin Connect app ──▶ Garmin Connect (cloud)
+                                                     │
+                                         GARMIN Connect MCP (runs locally)
+                                                     │  MCP tools
+                                                     ▼
+                                 Your AI client (Cursor, Codex CLI, Gemini CLI, opencode, …)
+```
+
+Your Garmin password and login tokens stay on your machine. The AI client only sees the tool results it asks for.
+
+## Getting Started (Step by Step)
+
+### 1. Install the prerequisites
+
+| You need | Why | How |
+|---|---|---|
+| **Git** | Download this repository | [git-scm.com/downloads](https://git-scm.com/downloads) |
+| **uv** | Installs Python 3.11+ and all dependencies for you | macOS/Linux: `curl -LsSf https://astral.sh/uv/install.sh \| sh`<br>Windows (PowerShell): `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 \| iex"` |
+| **A Garmin Connect account** | The data source (not needed for demo mode) | Your watch should be syncing to the Garmin Connect app |
+| **An MCP client** | The AI you will chat with | Any client from [Works With Any MCP Harness](#works-with-any-mcp-harness) |
+
+You do not need to install Python yourself; `uv` downloads a suitable version automatically.
+
+### 2. Download the code
 
 ```bash
 git clone https://github.com/sheloab/GARMIN-Connect-MCP
 cd GARMIN-Connect-MCP
 uv sync
-cp .env.example .env
 ```
 
-Set Garmin credentials in `.env`:
+### 3. Try it without a Garmin account (optional)
+
+Demo mode serves **fictional** sample data, so you can check everything works before entering any credentials:
+
+```bash
+uv run garmin-mcp tools          # lists all tools and prompts
+uv run garmin-mcp serve --demo   # starts the server on fictional data (Ctrl+C to stop)
+```
+
+To try demo mode inside your AI client, add `"--demo"` to the end of the `args` list in the client config shown in [MCP Client Setup](#mcp-client-setup).
+
+### 4. Add your Garmin credentials
+
+Copy the example settings file and fill in your Garmin Connect email and password:
+
+```bash
+cp .env.example .env              # Windows PowerShell: Copy-Item .env.example .env
+```
 
 ```env
 GARMIN_EMAIL=you@example.com
 GARMIN_PASSWORD=your-password
 ```
 
-Authenticate once (interactive MFA supported):
+`.env` is listed in `.gitignore`, so it is never committed. Leave the provider keys empty unless you plan to use the [provider demo agents](#provider-demo-agents).
+
+### 5. Log in once
 
 ```bash
 uv run garmin-mcp login
+```
+
+Run this in a normal terminal: if your account uses two-factor authentication, Garmin sends a code and the command asks you to type it. The login tokens are saved in `~/.garminconnect` (change with `GARMIN_TOKEN_STORE`), so later starts do not need to log in again.
+
+### 6. Check the setup
+
+```bash
 uv run garmin-mcp doctor --live
 ```
 
-List available MCP tools, then run the server:
+Every required line should say `OK`. `WARN` lines for provider keys are fine if you do not use the provider demo agents.
+
+### 7. Connect your AI client
+
+Add the server to your client's MCP configuration (see [MCP Client Setup](#mcp-client-setup) below), replacing `/path/to/GARMIN-Connect-MCP` with the folder you cloned. Restart the client, and the Garmin tools appear in its tool list.
+
+You can also run the server yourself, over stdio or HTTP:
 
 ```bash
-uv run garmin-mcp tools
 uv run garmin-mcp serve --transport stdio
-```
-
-HTTP transport:
-
-```bash
 uv run garmin-mcp serve --transport http --host 127.0.0.1 --port 8765
-# clients connect to http://127.0.0.1:8765/mcp
+# HTTP clients connect to http://127.0.0.1:8765/mcp
 ```
 
-> Windows (PowerShell) equivalents: `uv sync`, `Copy-Item .env.example .env`, `notepad .env`, then the same `uv run garmin-mcp ...` commands.
+### 8. Ask your first questions
+
+Just ask in plain language; the AI picks the right tools. For example:
+
+| Ask | Tools it will likely use |
+|---|---|
+| "How recovered am I today? Should I train hard?" | `get_recovery`, `get_training_readiness_history` |
+| "Analyze last night's sleep. Why was my REM low?" | `get_sleep`, `get_sleep_detail` |
+| "Break my last run down per kilometre." | `get_recent_activities`, `get_activity_distance_splits` |
+| "Did I stop or walk during my last run?" | `get_activity_segments` |
+| "What drained my Body Battery yesterday?" | `get_body_battery`, `get_daily_timeline` |
+| "How has my HRV trended over the last 3 months?" | `get_hrv_trend`, `get_long_term_trends` |
+| "Am I increasing my running load too fast?" | `get_running_tolerance`, `get_training_load` |
+| "Plan an easy run for tonight in my real HR zones." | `get_zones`, `get_recovery` |
+| "How many km have my shoes done?" | `get_gear` |
+| "How much have I run this year?" | `get_yearly_totals` |
+
+### Keeping the data fresh
+
+The server reads what is in Garmin Connect, not what is on your watch. **Sync your watch in the Garmin Connect app before asking**, otherwise you get the data from the last sync (`get_devices` shows the last upload time). Responses are cached for 2 minutes (`GARMIN_CACHE_TTL_SECONDS`), so after syncing, wait a moment before asking again.
 
 ## MCP Client Setup
 
@@ -171,6 +244,9 @@ Per-client examples (Cursor, Continue, Hermes, generic stdio/HTTP) live in [docs
 | `get_resting_heart_rate` | Daily RHR with 7-day and 30-day trend summaries, up to 30 days |
 | `get_stress` | Daily stress buckets and average stress |
 | `get_daily_vitals` | **New.** Daily HR (min/max/resting), SpO2, respiration, time in rest/low/medium/high stress, and altitude |
+| `get_sleep_detail` | **New.** One night in detail: stage-by-stage timeline with clock times, hourly HR/HRV/SpO2/stress/Body Battery, minutes of SpO2 below 90%, restless moments, breathing disruptions |
+| `get_hrv_trend` | **New.** Up to 90 nights of HRV with 5-minute high, status, personal baseline range, and nights below baseline |
+| `get_daily_timeline` | **New.** Hour-by-hour HR, stress, Body Battery, SpO2 and respiration for any day, plus auto-detected activities |
 | `get_health_summary` | Compact recovery, sleep, RHR, and stress snapshot |
 
 ### Activity and training
@@ -181,11 +257,16 @@ Per-client examples (Cursor, Continue, Hermes, generic stdio/HTTP) live in [docs
 | `get_recent_activities` | Recent normalized activity summaries |
 | `get_activity_detail` | One activity with training effect, weather, and time in HR and power zones |
 | `get_activity_splits` | Per-lap splits with pace, HR, cadence, elevation and HR drift |
+| `get_activity_distance_splits` | **New.** Per-km (or custom distance) splits computed from the second-by-second recording, independent of auto-lap: pace, grade-adjusted pace, HR, cadence, stride, ground contact, power, elevation, split pattern and aerobic decoupling |
+| `get_activity_segments` | **New.** Garmin's run/walk/stand detection within an activity, with paused time |
 | `get_recent_load` | Volume by sport based on recent activities |
 | `get_training_load` | Native Garmin Training Load when the device/account exposes it |
 | `get_running_tolerance` | **New.** Weekly running impact load as a percentage of Garmin's running tolerance |
 | `get_running_summary` | Running summary with pace, HR, longest and fastest run |
 | `get_monthly_running_stats` | Monthly running breakdown |
+| `get_yearly_totals` | **New.** Year-to-date totals per sport: count, distance, time, average and longest |
+| `get_workouts` | **New.** Saved workouts in your Garmin Connect library |
+| `get_workout_detail` | **New.** Step-by-step structure of a saved workout with pace (min/km), HR, power and cadence targets |
 
 ### Performance
 
@@ -194,15 +275,17 @@ Per-client examples (Cursor, Continue, Hermes, generic stdio/HTTP) live in [docs
 | `get_fitness` | VO2 Max, FTP, and race predictions |
 | `get_performance_metrics` | **New.** Endurance score and level, hill score, fitness age, lactate threshold (HR, pace, running power), heat/altitude acclimation, VO2 Max trend |
 | `get_race_prediction_trend` | **New.** Daily 5K/10K/half/marathon predictions and how they changed |
-| `get_zones` | Heart-rate zones and thresholds from Garmin user settings |
+| `get_zones` | Heart-rate zone ranges (bpm) per sport with max/resting/threshold HR, running power zones, and thresholds |
+| `get_long_term_trends` | **New.** Up to 52 weeks of weekly steps, stress, HRV, resting HR, sleep, SpO2 and respiration with recent-vs-earlier comparison |
 | `get_personal_records` | Garmin personal records |
 
 ### Gear, devices and body
 
 | Tool | Purpose |
 |---|---|
-| `get_gear` | **New.** Shoes and other gear with distance, activity count, and percent of max distance used |
-| `get_devices` | **New.** Registered Garmin devices, firmware version, and last upload |
+| `get_gear` | **New.** Shoes and other gear: distance, activity count, percent of max distance and km remaining, default activity types, last use, last-30-day usage |
+| `get_devices` | **New.** Registered Garmin devices, firmware version, last upload, and alarms |
+| `get_badges` | **New.** Earned badges and points, badges in progress, and joined challenges |
 | `get_body_metrics` | **New.** Weigh-ins and body composition, blood pressure readings, and today's hydration |
 | `get_full_snapshot` | Broad multi-section Garmin snapshot |
 
@@ -268,6 +351,7 @@ The `--allow-external-health-data` flag is required because Garmin tool results 
 - MCP clients that run locally can call Garmin tools without sending provider API keys to this project.
 - Provider demo commands such as `garmin-mcp ask` can send Garmin health/activity results to the selected LLM provider, so the CLI requires `--allow-external-health-data`.
 - `get_zones` returns only zone/threshold fields from the Garmin profile, not the raw profile (gender, birth date, weight, and similar PII are trimmed).
+- Activity tools never return GPS coordinates, and workout/badge tools drop your Garmin display name and profile image, so routes and identity stay out of LLM conversations.
 
 ## Testing
 
@@ -292,12 +376,25 @@ uv run pytest tests/live
 - **`Garmin authentication failed`** — check `GARMIN_EMAIL`/`GARMIN_PASSWORD`, then run `uv run garmin-mcp login` from a real terminal (MFA prompts need interactive input).
 - **A tool returns `errors`** — the array names the endpoint that failed; the rest of the payload is still valid partial data.
 - **A tool returns empty lists** (for example `get_body_metrics`) — nothing was logged in Garmin Connect for that period.
+- **Today's data looks old** — sync the watch in the Garmin Connect app, wait a minute, and ask again; `get_devices` shows when the watch last uploaded.
+- **The AI client does not show the Garmin tools** — check the `--directory` path in the client config points to your clone, then fully restart the client.
 
 ## Garmin Disclaimer
 
 This project uses the community `garminconnect` Python package and Garmin Connect endpoints. Garmin Connect is not a public API for individual open-source projects, and authentication or endpoint behavior may change without notice. This project is not affiliated with or endorsed by Garmin.
 
 Some metrics depend on Garmin device capabilities. For example, a device may expose VO2 Max and Training Effect but not native Garmin Training Load or Training Status. Zone availability depends on what the Garmin user settings endpoint exposes for your account.
+
+## Contributing
+
+Contributions are welcome. To add or change a tool:
+
+1. Write the tool function in `src/mcp_garmin_connect/tools.py`. Fetch Garmin data through `_endpoint(...)` so it is cached and failures are reported in an `errors` array instead of crashing.
+2. Register it in `TOOL_SPECS` at the bottom of the same file, with a clear docstring (it becomes the tool description the AI reads) and a JSON schema for its parameters.
+3. Add a test in `tests/test_tools.py` using the `FakeGarmin` client with **fictional** values, and update the tool count in `tests/test_server.py`.
+4. Run `uv run ruff check .` and `uv run pytest` before opening a pull request.
+
+Please keep personal data out of contributions: no real Garmin IDs, GPS coordinates, health values or credentials in code, tests or issues.
 
 ## License
 

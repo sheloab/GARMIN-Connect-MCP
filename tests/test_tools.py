@@ -10,6 +10,8 @@ from mcp_garmin_connect.garmin_client import GarminClientManager, reset_manager
 from mcp_garmin_connect.tools import (
     TOOL_SPECS,
     _hr_drift,
+    get_activity_distance_splits,
+    get_activity_segments,
     get_activity_splits,
     get_body_battery,
     get_daily_activity,
@@ -22,7 +24,10 @@ from mcp_garmin_connect.tools import (
     get_running_summary,
     get_running_tolerance,
     get_sleep,
+    get_sleep_detail,
     get_training_readiness_history,
+    get_workout_detail,
+    get_yearly_totals,
     get_zones,
     tool_schema,
 )
@@ -123,7 +128,20 @@ class FakeGarmin:
                 }
             ],
         }
+        dto["sleepStartTimestampGMT"] = 1893533400000
         return {
+            "sleepLevels": [
+                {"startGMT": "2030-01-01T21:30:00.0", "endGMT": "2030-01-01T21:50:00.0",
+                 "activityLevel": 0.0},
+                {"startGMT": "2030-01-01T21:50:00.0", "endGMT": "2030-01-01T22:10:00.0",
+                 "activityLevel": 0.0},
+                {"startGMT": "2030-01-01T22:10:00.0", "endGMT": "2030-01-01T22:20:00.0",
+                 "activityLevel": 3.0},
+            ],
+            "wellnessEpochSPO2DataDTOList": [
+                {"epochTimestamp": "2030-01-01T21:40:00.0", "spo2Reading": 88},
+                {"epochTimestamp": "2030-01-01T21:41:00.0", "spo2Reading": 95},
+            ],
             "dailySleepDTO": dto,
             "avgOvernightHrv": 60.0,
             "hrvStatus": "BALANCED",
@@ -208,6 +226,88 @@ class FakeGarmin:
     def get_running_tolerance(self, start: str, end: str) -> list[dict[str, Any]]:
         return [{"startOfWeek": "2030-01-01", "totalImpactLoad": 5000, "tolerance": 20000,
                  "totalDistance": 12000.0}]
+
+    def get_activity_details(
+        self, activity_id: int, maxchart: int = 2000, maxpoly: int = 4000
+    ) -> dict[str, Any]:
+        keys = [
+            "sumDistance",
+            "sumDuration",
+            "sumElapsedDuration",
+            "directSpeed",
+            "directHeartRate",
+            "directDoubleCadence",
+            "directLatitude",
+        ]
+        rows = []
+        for second in range(1101):
+            distance = second * 2.5
+            rows.append(
+                {
+                    "metrics": [
+                        distance,
+                        float(second),
+                        float(second) + (60.0 if second == 1100 else 0.0),
+                        2.5,
+                        130 if distance <= 1375 else 132,
+                        170.0,
+                        1.23,
+                    ]
+                }
+            )
+        return {
+            "metricDescriptors": [{"key": k, "metricsIndex": i} for i, k in enumerate(keys)],
+            "activityDetailMetrics": rows,
+        }
+
+    def get_heart_rate_zones(self) -> list[dict[str, Any]]:
+        return [{"sport": "RUNNING", "trainingMethod": "HR_MAX", "maxHeartRateUsed": 190,
+                 "restingHeartRateUsed": 50, "zone1Floor": 95, "zone2Floor": 114,
+                 "zone3Floor": 133, "zone4Floor": 152, "zone5Floor": 171}]
+
+    def get_power_zones_for_sport(self, sport: str) -> dict[str, Any]:
+        return {"sport": sport, "functionalThresholdPower": 300.0, "zone1Floor": 200.0,
+                "zone2Floor": 250.0, "zone3Floor": 0.0}
+
+    def get_activity_typed_splits(self, activity_id: int) -> dict[str, Any]:
+        return {"splits": [
+            {"type": "INTERVAL_ACTIVE", "duration": 1800.0, "elapsedDuration": 1920.0,
+             "distance": 5000.0},
+            {"type": "RWD_RUN", "startTimeLocal": "2030-01-01T07:00:00.0", "duration": 600.0,
+             "distance": 1600.0, "averageHR": 140.0},
+            {"type": "RWD_WALK", "startTimeLocal": "2030-01-01T07:10:00.0", "duration": 60.0,
+             "distance": 100.0},
+            {"type": "RWD_STAND", "startTimeLocal": "2030-01-01T07:11:00.0", "duration": 0.0},
+        ]}
+
+    def get_workout_by_id(self, workout_id: int) -> dict[str, Any]:
+        return {
+            "workoutName": "Intervals",
+            "sportType": {"sportTypeKey": "running"},
+            "author": {"fullName": "Private Person"},
+            "workoutSegments": [{"workoutSteps": [
+                {"type": "ExecutableStepDTO", "stepType": {"stepTypeKey": "warmup"},
+                 "endCondition": {"conditionTypeKey": "time"}, "endConditionValue": 600.0,
+                 "targetType": {"workoutTargetTypeKey": "no.target"}},
+                {"type": "RepeatGroupDTO", "numberOfIterations": 5, "workoutSteps": [
+                    {"type": "ExecutableStepDTO", "stepType": {"stepTypeKey": "interval"},
+                     "endCondition": {"conditionTypeKey": "distance"},
+                     "endConditionValue": 1000.0,
+                     "targetType": {"workoutTargetTypeKey": "pace.zone"},
+                     "targetValueOne": 3.333333, "targetValueTwo": 3.030303},
+                ]},
+            ]}],
+        }
+
+    def get_progress_summary_between_dates(
+        self, start: str, end: str, metric: str, group: bool
+    ) -> list[dict[str, Any]]:
+        if metric == "distance":
+            stats = {"running": {"distance": {"count": 10, "sum": 5000000.0, "avg": 500000.0,
+                                              "max": 1000000.0}}}
+        else:
+            stats = {"running": {"duration": {"count": 10, "sum": 18000000.0}}}
+        return [{"stats": stats}]
 
     def get_activity_splits(self, activity_id: int) -> dict[str, Any]:
         if activity_id == 2:
@@ -630,6 +730,116 @@ def test_running_tolerance_percent() -> None:
 
     assert week["percent_of_tolerance"] == 25
     assert week["distance_km"] == 12.0
+
+
+def test_activity_distance_splits_from_stream() -> None:
+    import mcp_garmin_connect.garmin_client as garmin_client
+
+    garmin_client._manager = FakeManager()
+
+    result = get_activity_distance_splits(activity_id=1, split_km=1.0)
+
+    assert result["split_count"] == 3
+    first = result["splits"][0]
+    assert first["distance_m"] == 1000
+    assert first["pace"] == "6:40/km"
+    assert first["hr_avg"] == 130
+    assert first["cadence_spm"] == 170
+    assert "latitude" not in str(first).lower()
+    assert result["splits"][2]["partial"] is True
+    assert result["splits"][2]["distance_m"] == 750
+    assert result["split_pattern"] == "even"
+    assert result["stopped_time"] == "1:00"
+    assert result["aerobic_decoupling"]["percent"] == 1.5
+
+
+def test_zones_include_hr_and_power_ranges() -> None:
+    import mcp_garmin_connect.garmin_client as garmin_client
+
+    garmin_client._manager = FakeManager()
+
+    result = get_zones()
+
+    zones = result["heart_rate_zones"][0]["zones_bpm"]
+    assert zones[1] == {"zone": 2, "low": 114, "high": 132}
+    assert zones[-1] == {"zone": 5, "low": 171, "high": 190}
+    assert result["running_power_zones"]["zones_w"] == [
+        {"zone": 1, "low": 200, "high": 249},
+        {"zone": 2, "low": 250, "high": None},
+    ]
+
+
+def test_sleep_detail_merges_stages_in_local_time() -> None:
+    import mcp_garmin_connect.garmin_client as garmin_client
+
+    garmin_client._manager = FakeManager()
+
+    result = get_sleep_detail(date="2030-01-02")
+
+    assert result["stage_timeline"] == [
+        {"stage": "deep", "start": "22:30", "end": "23:10", "minutes": 40},
+        {"stage": "awake", "start": "23:10", "end": "23:20", "minutes": 10},
+    ]
+    assert result["awakenings"] == 1
+    assert result["spo2"]["lowest"] == 88
+    assert result["spo2"]["lowest_at"] == "22:40"
+    assert result["spo2"]["minutes_below_90"] == 1
+    assert get_sleep_detail(date="02/01/2030")["error"].startswith("invalid date")
+
+
+def test_activity_segments_totals_and_pause() -> None:
+    import mcp_garmin_connect.garmin_client as garmin_client
+
+    garmin_client._manager = FakeManager()
+
+    result = get_activity_segments(activity_id=1)
+
+    assert result["segment_count"] == 2
+    assert result["totals"]["run"] == {"count": 1, "duration": "10:00", "distance_km": 1.6}
+    assert result["segments"][0]["pace"] == "6:15/km"
+    assert result["paused_time"] == "2:00"
+
+
+def test_workout_detail_flattens_repeats_and_converts_pace() -> None:
+    import mcp_garmin_connect.garmin_client as garmin_client
+
+    garmin_client._manager = FakeManager()
+
+    result = get_workout_detail(workout_id=7)
+
+    assert "Private Person" not in str(result)
+    assert result["steps"][0] == {"type": "warmup", "duration": "10:00", "target": None,
+                                  "description": None}
+    repeat = result["steps"][1]
+    assert repeat["times"] == 5
+    assert repeat["steps"][0]["duration"] == "1 km"
+    assert repeat["steps"][0]["target"] == {"type": "pace", "range": ["5:00/km", "5:30/km"]}
+
+
+def test_yearly_totals_convert_units() -> None:
+    import mcp_garmin_connect.garmin_client as garmin_client
+
+    garmin_client._manager = FakeManager()
+
+    running = get_yearly_totals(year=2030)["sports"][0]
+
+    assert running == {
+        "sport": "running",
+        "activities": 10,
+        "distance_km": 50.0,
+        "avg_distance_km": 5.0,
+        "longest_km": 10.0,
+        "total_hours": 5.0,
+    }
+
+
+def test_without_gps_strips_coordinates() -> None:
+    from mcp_garmin_connect.tools import _without_gps
+
+    cleaned = _without_gps({"distance": 5000, "startLatitude": -1.0, "endLongitude": 2.0,
+                            "nested": [{"latitude": 1, "hr": 140}]})
+
+    assert cleaned == {"distance": 5000, "nested": [{"hr": 140}]}
 
 
 def test_tool_schemas_are_objects() -> None:
