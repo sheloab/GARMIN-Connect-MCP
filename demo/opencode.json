@@ -1,0 +1,21 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "share": "disabled",
+  "mcp": {
+    "garmin": {
+      "type": "local",
+      "command": [
+        "uv",
+        "--directory",
+        "..",
+        "run",
+        "garmin-mcp",
+        "serve",
+        "--demo",
+        "--transport",
+        "stdio"
+      ],
+      "enabled": true
+    }
+  }
+}

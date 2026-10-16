@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-label="mcp-garmin-connect — LLM-agnostic Garmin Connect MCP server">
+  <rect width="1280" height="640" fill="#0b1220"/>
+  <rect y="220" width="1280" height="220" fill="#0e1a2b"/>
+
+  <circle cx="1180" cy="80" r="300" fill="#0d1a2c"/>
+  <circle cx="90" cy="600" r="240" fill="#0d1c26"/>
+  <circle cx="1180" cy="80" r="170" fill="none" stroke="#14304a" stroke-width="1.5"/>
+  <circle cx="1180" cy="80" r="230" fill="none" stroke="#102639" stroke-width="1.5"/>
+
+  <text x="640" y="268" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="72" font-weight="700" fill="#f8fafc">GARMIN Connect MCP</text>
+  <text x="640" y="330" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="30" fill="#94a3b8">LLM-agnostic MCP server for Garmin Connect</text>
+
+  <rect x="240" y="382" rx="23" ry="23" width="160" height="46" fill="#0f2438" stroke="#2b5a78" stroke-width="1.5"/>
+  <text x="320" y="412" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="19" fill="#7dd3fc">36 tools</text>
+
+  <rect x="416" y="382" rx="23" ry="23" width="180" height="46" fill="#0f2438" stroke="#2c6647" stroke-width="1.5"/>
+  <text x="506" y="412" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="19" fill="#86efac">4 prompts</text>
+
+  <rect x="612" y="382" rx="23" ry="23" width="180" height="46" fill="#0f2438" stroke="#3a4a5e" stroke-width="1.5"/>
+  <text x="702" y="412" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="19" fill="#cbd5e1">stdio + http</text>
+
+  <rect x="808" y="382" rx="23" ry="23" width="130" height="46" fill="#0f2438" stroke="#3a4a5e" stroke-width="1.5"/>
+  <text x="873" y="412" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="19" fill="#cbd5e1">MIT</text>
+
+  <path stroke="#38bdf8" stroke-width="3.5" fill="none" stroke-linecap="round" stroke-linejoin="round"
+        d="M 240 512 H 400 L 436 472 L 472 512 H 560 L 596 440 L 632 512 H 700 L 736 484 L 772 512 H 1040"/>
+  <circle cx="596" cy="440" r="5" fill="#22c55e"/>
+  <circle cx="436" cy="472" r="4" fill="#22c55e"/>
+</svg>
