@@ -112,9 +112,23 @@ Your Garmin password and login tokens stay on your machine. The AI client only s
 | **Git** | Download this repository | [git-scm.com/downloads](https://git-scm.com/downloads) |
 | **uv** | Installs Python 3.11+ and all dependencies for you | macOS/Linux: `curl -LsSf https://astral.sh/uv/install.sh \| sh`<br>Windows (PowerShell): `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 \| iex"` |
 | **A Garmin Connect account** | The data source (not needed for demo mode) | Your watch should be syncing to the Garmin Connect app |
+| **A Garmin Personal API key** (recommended) | Lets the official backend read your data | See [Get your Personal API key](#get-your-personal-api-key) below |
 | **An MCP client** | The AI you will chat with | Any client from [Works With Any MCP Harness](#works-with-any-mcp-harness) |
 
 You do not need to install Python yourself; `uv` downloads a suitable version automatically.
+
+#### Get your Personal API key
+
+The key is self-serve. You don't need to apply or wait for approval.
+
+1. Sign in to [Garmin Connect](https://connect.garmin.com) in a web browser (not the phone app), using the account your watch syncs to.
+2. Open <https://connect.garmin.com/app/settings/personalApiToken>.
+3. Click **Create Key** and accept the terms.
+4. Choose how long the key stays valid: 30, 90, 180 or 365 days.
+5. **Copy the key right away.** Garmin shows it only once. If you lose it, delete it and create a new one.
+6. Keep the key somewhere safe, such as a password manager. You will paste it into `.env` in [step 4](#4-add-your-garmin-credentials).
+
+Treat the key like a password. Never commit it or share it in chats or issues. You can revoke it, or create a replacement when it expires, on the same page. If you'd rather not use a key, skip this part and use the email/password backend in step 4.
 
 ### 2. Download the code
 
@@ -146,8 +160,8 @@ cp .env.example .env              # Windows PowerShell: Copy-Item .env.example .
 Pick a backend in `.env`:
 
 ```env
-# Official Personal API (recommended): create a key at
-# https://connect.garmin.com/app/settings/personalApiToken
+# Official Personal API (recommended): paste the key from
+# "Get your Personal API key" in step 1
 GARMIN_AUTH_MODE=personal
 GARMIN_PERSONAL_API_KEY=your-key-here
 ```
@@ -210,9 +224,77 @@ Just ask in plain language; the AI picks the right tools. For example:
 | "How many km have my shoes done?" | `get_gear` |
 | "How much have I run this year?" | `get_yearly_totals` |
 
+More ready-to-use prompts are in [Example Prompts](#example-prompts).
+
 ### Keeping the data fresh
 
 The server reads what is in Garmin Connect, not what is on your watch. **Sync your watch in the Garmin Connect app before asking**, otherwise you get the data from the last sync (`get_devices` shows the last upload time). Responses are cached for 2 minutes (`GARMIN_CACHE_TTL_SECONDS`), so after syncing, wait a moment before asking again.
+
+## Example Prompts
+
+Copy any of these into your AI client. Change the dates, distances and goals to match your own.
+
+### Sleep
+
+- "How did I sleep last night? Compare it with my 7-day average."
+- "Why was my REM sleep low last night? Show the stage timeline."
+- "What time did I go to bed and wake up this week, and how consistent was it?"
+- "Did my naps this week help or hurt my night sleep?"
+- "What bedtime does Garmin recommend for me tonight, and why?"
+- "Show my SpO2 and breathing during sleep. Were there any dips?"
+- "How has my sleep score trended over the last 30 days?"
+
+### Recovery and HRV
+
+- "How recovered am I today? Should I train hard, train easy or rest?"
+- "Explain my training readiness score. Which factor is pulling it down?"
+- "How has my HRV trended over the last 90 days? Am I within my baseline?"
+- "My resting heart rate went up this week. What could be causing it?"
+- "Compare my stress levels on workdays and weekends."
+- "Am I showing any signs of overtraining or getting sick?"
+
+### Body Battery and energy
+
+- "What's my Body Battery right now, and what drained it today?"
+- "How much did my Body Battery recharge overnight?"
+- "Which activities or times of day drain my Body Battery the most?"
+- "Show my Body Battery highs and lows for the past week."
+- "Hour by hour, how did my heart rate, stress and Body Battery change yesterday?"
+
+### Running coach
+
+- "Analyze my last run: pace, heart rate, cadence and splits per km."
+- "Did I walk or stop during my last run? How much time did I lose?"
+- "Plan an easy run for tonight using my real heart-rate zones."
+- "Build me a 12-week half marathon plan based on my current fitness."
+- "How long do I need to train for a 10K? Recommend a plan length."
+- "Am I increasing my running load too fast? Check my running tolerance and training load."
+- "What are my race predictions, and how have they changed this month?"
+- "How did my VO2 Max, endurance score and lactate threshold change lately?"
+- "When is the best time to run this week, based on air quality where I usually run?"
+- "Review my running this month: volume, pace, longest run and what to improve."
+
+### Training and activity
+
+- "Summarize my training this week by sport."
+- "How many steps and intensity minutes did I get today compared with my goal?"
+- "Show my saved workouts and explain the structure of [workout name]."
+- "How much have I run, walked and cycled this year?"
+- "List my personal records and tell me which ones are within reach."
+
+### Gear, devices and body
+
+- "How many kilometres do my running shoes have? When should I replace them?"
+- "When did my watch last sync, and what firmware is it on?"
+- "Show my weight and body composition trend."
+- "Which badges am I close to earning?"
+
+### Full check-ins
+
+- "Give me a full health review: sleep, recovery, stress, Body Battery and training."
+- "Write my weekly training review, with what went well and what to change next week."
+- "Act as my running coach. Look at my last 4 weeks and tell me what to do this week."
+- "Compare this month with last month for sleep, resting HR, HRV and running volume."
 
 ## MCP Client Setup
 
