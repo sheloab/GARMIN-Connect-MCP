@@ -33,9 +33,98 @@ def run_checks(include_live: bool = False) -> list[Check]:
             Check("demo-mode", True, "GARMIN_DEMO=1: serving fictional sample data")
         )
         include_live = False
+    elif settings.resolved_auth_mode() == "hybrid":
+        checks.extend(
+            [
+                Check(
+                    "auth-backend",
+                    True,
+                    "hybrid: official Personal API for wellness/raw data + email/password "
+                    "for Garmin-derived metrics",
+                ),
+                Check(
+                    "personal-api-key",
+                    bool(settings.garmin_personal_api_key),
+                    "GARMIN_PERSONAL_API_KEY configured"
+                    if settings.garmin_personal_api_key
+                    else "GARMIN_PERSONAL_API_KEY missing (hybrid needs both credential sets)",
+                ),
+                Check(
+                    "garmin-email",
+                    bool(settings.garmin_email),
+                    "GARMIN_EMAIL configured (derived metrics)",
+                ),
+                Check(
+                    "garmin-password",
+                    bool(settings.garmin_password),
+                    "GARMIN_PASSWORD configured (derived metrics)",
+                ),
+                Check(
+                    "token-cache",
+                    manager.token_cache_present(),
+                    "Garmin token cache present"
+                    if manager.token_cache_present()
+                    else "Run garmin-mcp login",
+                ),
+                Check(
+                    "personal-token-cache",
+                    manager.personal_token_cache_present(),
+                    f"Bearer token cache: {settings.garmin_personal_token_cache}"
+                    if manager.personal_token_cache_present()
+                    else "No cached bearer token yet (fetched on first request)",
+                ),
+            ]
+        )
+        if include_live:
+            try:
+                manager.login_hybrid()
+                checks.append(
+                    Check("garmin-live-login", True, "hybrid backend: both backends reachable")
+                )
+            except Exception as exc:
+                checks.append(
+                    Check("garmin-live-login", False, f"{type(exc).__name__}: {exc}")
+                )
+        include_live = False
+    elif settings.resolved_auth_mode() == "personal":
+        checks.extend(
+            [
+                Check(
+                    "auth-backend",
+                    True,
+                    "official Garmin Personal API (GARMIN_AUTH_MODE=personal)",
+                ),
+                Check(
+                    "personal-api-key",
+                    bool(settings.garmin_personal_api_key),
+                    "GARMIN_PERSONAL_API_KEY configured",
+                ),
+                Check(
+                    "personal-token-cache",
+                    manager.personal_token_cache_present(),
+                    f"Bearer token cache: {settings.garmin_personal_token_cache}"
+                    if manager.personal_token_cache_present()
+                    else "No cached bearer token yet (fetched on first request)",
+                ),
+            ]
+        )
+        if include_live:
+            try:
+                manager.login_personal()
+                checks.append(Check("personal-api-live", True, "Personal API token + profile OK"))
+            except Exception as exc:
+                checks.append(
+                    Check("personal-api-live", False, f"{type(exc).__name__}: {exc}")
+                )
+        include_live = False
     else:
         checks.extend(
             [
+                Check(
+                    "auth-backend",
+                    True,
+                    "unofficial email/password flow (GARMIN_AUTH_MODE=unofficial)",
+                ),
                 Check("garmin-email", bool(settings.garmin_email), "GARMIN_EMAIL configured"),
                 Check(
                     "garmin-password",
@@ -56,6 +145,15 @@ def run_checks(include_live: bool = False) -> list[Check]:
                 ),
             ]
         )
+        if settings.garmin_personal_api_key:
+            checks.append(
+                Check(
+                    "personal-api-key",
+                    True,
+                    "GARMIN_PERSONAL_API_KEY present but unused "
+                    "(set GARMIN_AUTH_MODE=personal to switch)",
+                )
+            )
     for provider_name, spec in provider_specs(settings).items():
         checks.append(
             Check(

@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "garmin": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "..",
+        "run",
+        "garmin-mcp",
+        "serve",
+        "--demo",
+        "--transport",
+        "stdio"
+      ]
+    }
+  }
+}

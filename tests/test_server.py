@@ -6,6 +6,12 @@ def test_create_server() -> None:
 
 
 def test_list_capabilities() -> None:
+    from mcp_garmin_connect.tools import TOOL_SPECS
+
     capabilities = list_capabilities()
-    assert len(capabilities["tools"]) == 36
-    assert len(capabilities["prompts"]) == 4
+    # Assert against the registry instead of a magic number, so adding a tool does
+    # not require editing this test.
+    assert len(capabilities["tools"]) == len(TOOL_SPECS)
+    from mcp_garmin_connect.prompts import PROMPT_SPECS
+
+    assert len(capabilities["prompts"]) == len(PROMPT_SPECS)

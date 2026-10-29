@@ -15,6 +15,18 @@ def _day(offset: int) -> str:
     return (date.today() - timedelta(days=offset)).isoformat()
 
 
+def _days_between(start: str, end: str) -> list[str]:
+    """Inclusive list of ISO dates, oldest first, like the range endpoints return."""
+    first = date.fromisoformat(start)
+    last = date.fromisoformat(end)
+    days: list[str] = []
+    current = first
+    while current <= last:
+        days.append(current.isoformat())
+        current += timedelta(days=1)
+    return days
+
+
 def _activity(
     offset: int,
     name: str,
@@ -76,6 +88,7 @@ class DemoGarmin:
     """Deterministic stand-in for ``garminconnect.Garmin`` with fictional data."""
 
     display_name = "demo-athlete"
+    backend_name = "demo"
 
     def login(self, tokenstore: str | None = None) -> None:
         return None
@@ -87,7 +100,7 @@ class DemoGarmin:
                 "level": "MODERATE",
                 "feedbackShort": "TRAINING_READY",
                 "feedbackLong": "You are ready for a moderate session today.",
-                "recoveryTime": 6,
+                "recoveryTime": 660,  # minutes (the tool converts to hours)
                 "sleepScore": 82,
                 "hrvWeeklyAverage": 44,
             }
@@ -131,15 +144,24 @@ class DemoGarmin:
         }
 
     def get_body_battery(self, start: str, end: str) -> list[dict[str, Any]]:
-        return [
-            {
-                "charged": 62,
-                "drained": 49,
-                "highestBatteryLevel": 86,
-                "lowestBatteryLevel": 21,
-                "endOfDayBatteryLevel": 37,
-            }
-        ]
+        # One entry per day, like Garmin: the date field is what the range tool keys on.
+        first = date.fromisoformat(start)
+        last = date.fromisoformat(end)
+        days: list[dict[str, Any]] = []
+        current = first
+        while current <= last:
+            days.append(
+                {
+                    "date": f"{current.isoformat()}T00:00:00.000",
+                    "charged": 62,
+                    "drained": 49,
+                    "highestBatteryLevel": 86,
+                    "lowestBatteryLevel": 21,
+                    "endOfDayBatteryLevel": 37,
+                }
+            )
+            current += timedelta(days=1)
+        return days
 
     def get_rhr_day(self, cdate: str) -> dict[str, Any]:
         return {
@@ -240,3 +262,47 @@ class DemoGarmin:
         if "personalrecordtype" in url:
             return list(_DEMO_PR_TYPES)
         return {}
+
+    # -- Personal API-only tools (fictional data, same shapes) -------------
+    def get_body_composition(self, start: str, end: str) -> dict[str, Any]:
+        return {
+            "dateWeightList": [
+                {
+                    "calendarDate": _day(offset),
+                    "weight": 71200 + offset * 100,
+                    "bmi": 23.8,
+                    "bodyFat": 19.4,
+                    "muscleMass": 33200,
+                    "bodyWater": 57.2,
+                }
+                for offset in range(0, 7)
+            ]
+        }
+
+    def get_spo2(self, cdate: str) -> dict[str, Any]:
+        return {"averageSpO2": 96.0, "lowestSpO2": 91.0, "latestSpO2": 97.0}
+
+    def get_hydration(self, start: str, end: str) -> list[dict[str, Any]]:
+        return [
+            {"calendarDate": day, "valueInML": 2400, "goalInML": 3000}
+            for day in _days_between(start, end)
+        ]
+
+    def get_steps(self, start: str, end: str) -> list[dict[str, Any]]:
+        days = _days_between(start, end)
+        return [
+            {"calendarDate": day, "totalSteps": 8400 - index * 120, "stepGoal": 8000}
+            for index, day in enumerate(days)
+        ]
+
+    def get_fitness_age(self, cdate: str | None = None) -> dict[str, Any]:
+        return {
+            "fitnessAge": 19.4,
+            "chronologicalAge": 21,
+            "achievableFitnessAge": 18.2,
+            "previousFitnessAge": 19.8,
+        }
+
+    def download_activity_file(self, activity_id: int) -> bytes:
+        # Not a real FIT file: enough for dry runs and tests to prove the write path.
+        return b"PK\x03\x04demo-zip" + str(activity_id).encode()

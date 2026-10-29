@@ -11,3 +11,4 @@ build/
 *.egg-info/
 .mypy_cache/
 .DS_Store
+.claude/settings.local.json

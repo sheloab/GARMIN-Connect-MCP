@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from mcp_garmin_connect.config import Settings
+from mcp_garmin_connect.config import MAX_DAYS_HEALTH, Settings
 from mcp_garmin_connect.errors import GarminAuthError
 from mcp_garmin_connect.garmin_client import GarminClientManager, reset_manager
 from mcp_garmin_connect.tools import (
@@ -611,15 +611,17 @@ def test_resting_heart_rate_daily_weekly_monthly_summary() -> None:
     assert len(result["daily"]) == 3
 
 
-def test_resting_heart_rate_clamps_to_30_days() -> None:
+def test_resting_heart_rate_clamps_to_the_health_cap() -> None:
     import mcp_garmin_connect.garmin_client as garmin_client
 
     garmin_client._manager = FakeManager()
 
     result = get_resting_heart_rate(days=365)
 
-    assert result["period_days"] == 30
-    assert len(result["daily"]) == 30
+    # The cap is configurable (GARMIN_MAX_DAYS_HEALTH), so assert against it
+    # rather than a hardcoded 30.
+    assert result["period_days"] == MAX_DAYS_HEALTH
+    assert len(result["daily"]) == MAX_DAYS_HEALTH
 
 
 def test_sleep_includes_naps_stages_and_vitals() -> None:

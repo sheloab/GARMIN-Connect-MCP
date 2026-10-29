@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextvars
+import os
 import re
 from collections import defaultdict
 from collections.abc import Callable
@@ -10,7 +12,9 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
+from .config import MAX_ACTIVITY_LIMIT, MAX_DAYS_ACTIVITIES, MAX_DAYS_HEALTH
 from .garmin_client import date_range_iso, get_manager, today_iso
+from .hybrid import capture_call
 from .normalizers import (
     activity_type_key,
     format_duration,
@@ -22,6 +26,7 @@ from .normalizers import (
 ErrorList = list[dict[str, str]]
 _FAILED = object()
 _ZONE_KEY_RE = re.compile(r"(zone|threshold|lactate|ftp|vo2)", re.IGNORECASE)
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 @dataclass(frozen=True)
@@ -83,9 +88,17 @@ def _endpoint(
     manager = get_manager()
 
     def cached_factory() -> Any:
-        return manager.safe_call(factory, default=_FAILED, label=label, errors=errors)
+        # capture_call keeps hybrid attribution working: the factory may run in a
+        # different thread (day loops) or not at all (cache hit -> replay below).
+        value, sources = capture_call(
+            manager.safe_call, factory, default=_FAILED, label=label, errors=errors
+        )
+        if value is not _FAILED:
+            manager.remember_sources(key, sources)
+        return value
 
     value = manager.cached(key, cached_factory)
+    manager.replay_sources(key)
     if value is _FAILED:
         manager.cache.delete(key)
         return default
@@ -95,8 +108,16 @@ def _endpoint(
 def _fetch_days(dates: list[str], fetch: Callable[[str], Any], max_workers: int = 4) -> list[Any]:
     if len(dates) <= 1:
         return [fetch(day) for day in dates]
+    # ContextVars are not inherited by thread-pool workers, and copying inside the
+    # worker would copy the worker's empty context. Copy here, in the parent, so
+    # hybrid usage capture still sees the calls made by the day loops.
+    contexts = [contextvars.copy_context() for _ in dates]
     with ThreadPoolExecutor(max_workers=min(max_workers, len(dates))) as ex:
-        return list(ex.map(fetch, dates))
+        futures = [
+            ex.submit(context.run, fetch, day)
+            for context, day in zip(contexts, dates, strict=True)
+        ]
+        return [future.result() for future in futures]
 
 
 def _sleep_day(day: str, errors: ErrorList | None = None) -> dict[str, Any]:
@@ -192,18 +213,66 @@ def _max_metrics(day: str, errors: ErrorList | None = None) -> Any:
     )
 
 
-def _activities_raw(limit: int = 200, errors: ErrorList | None = None) -> list[dict[str, Any]]:
+def _activities_raw(
+    limit: int = 200, errors: ErrorList | None = None, start: int = 0
+) -> list[dict[str, Any]]:
     client = _client()
     raw = _endpoint(
-        f"activities_raw:{limit}",
-        f"activities:{limit}",
-        lambda: client.get_activities(0, limit),
+        f"activities_raw:{start}:{limit}",
+        f"activities:{start}:{limit}",
+        lambda: client.get_activities(start, limit),
         [],
         errors,
     )
     if not isinstance(raw, list):
         return []
     return [item for item in raw if isinstance(item, dict)]
+
+
+def _activities_paged(
+    max_items: int,
+    errors: ErrorList | None = None,
+    page_size: int = 200,
+    stop_before: str | None = None,
+    max_pages: int = 10,
+) -> list[dict[str, Any]]:
+    """Walk Garmin's activity pages — a single call is capped around 200 items.
+
+    Without this, asking for more than one page silently returned only the newest
+    200 activities, so a true "all time" range was impossible.
+
+    `stop_before` (YYYY-MM-DD) stops paging once a page reaches past that date, which
+    is what makes an explicit `start_date` window usable: the newest N activities may
+    all be newer than the window being asked for. `max_pages` keeps a runaway loop
+    from hammering the API.
+    """
+    if max_items <= 0:
+        return []
+    out: list[dict[str, Any]] = []
+    start = 0
+    for _ in range(max(1, max_pages)):
+        page = _activities_raw(page_size, errors, start=start)
+        if not page:
+            break
+        out.extend(page)
+        if len(page) < page_size:
+            break
+        if stop_before:
+            oldest = (
+                min(
+                    (item.get("startTimeLocal") or "")[:10]
+                    for item in page
+                    if item.get("startTimeLocal")
+                )
+                if any(item.get("startTimeLocal") for item in page)
+                else ""
+            )
+            if oldest and oldest < stop_before:
+                break
+        start += page_size
+        if len(out) >= max_items:
+            break
+    return out[:max_items]
 
 
 def _extract_resting_heart_rate_bpm(raw: Any) -> int | None:
@@ -256,6 +325,31 @@ def _personal_record_label_key(value: Any) -> str | None:
             label = value.get(key)
             if isinstance(label, str) and label.strip():
                 return label.strip()
+    return None
+
+
+def _personal_record_value_unit(label: str | None) -> str | None:
+    """Garmin mixes types inside `value`, depending on the record type.
+
+    Durations arrive as "h:mm:ss" strings, distances and elevation as numbers in
+    metres, power in watts, steps/streaks as plain counts. Without this, callers
+    cannot tell whether 3000 means 3 km or 50 minutes (same class of bug as #3).
+    """
+    if not label:
+        return None
+    lowered = label.lower()
+    if lowered.startswith("fastest"):
+        return "duration"
+    if "power" in lowered:
+        return "watts"
+    if lowered.startswith("longest run") or lowered.startswith("longest ride"):
+        return "distance_m"
+    if "elevation" in lowered:
+        return "elevation_m"
+    if "steps" in lowered:
+        return "steps"
+    if "streak" in lowered:
+        return "days"
     return None
 
 
@@ -329,12 +423,7 @@ def get_recovery() -> dict[str, Any]:
             "level": item.get("level"),
             "feedback_short": item.get("feedbackShort"),
             "feedback_long": item.get("feedbackLong"),
-            # Garmin reports recoveryTime in minutes.
-            "recovery_time_hours": (
-                round(item["recoveryTime"] / 60, 1)
-                if isinstance(item.get("recoveryTime"), (int, float))
-                else None
-            ),
+            "recovery_time_hours": _minutes_to_hours(item.get("recoveryTime")),
             "sleep_score": item.get("sleepScore"),
             "hrv_weekly_avg": item.get("hrvWeeklyAverage"),
         }
@@ -391,9 +480,9 @@ def get_recovery() -> dict[str, Any]:
 
     training_status = None
     if isinstance(status_raw, dict):
-        latest_map = (
-            status_raw.get("mostRecentTrainingStatus") or {}
-        ).get("latestTrainingStatusData") or {}
+        latest_map = (status_raw.get("mostRecentTrainingStatus") or {}).get(
+            "latestTrainingStatusData"
+        ) or {}
         if latest_map:
             first = next(iter(latest_map.values()))
             if isinstance(first, dict):
@@ -424,6 +513,1321 @@ def get_recovery() -> dict[str, Any]:
         "body_battery_today": body_battery,
         "resting_heart_rate_bpm": resting_heart_rate,
         "training_status": training_status,
+        **_errors_payload(errors),
+    }
+
+
+def get_sleep(
+    days: Annotated[
+        int, Field(ge=1, le=MAX_DAYS_HEALTH, description="Lookback window in days.")
+    ] = 7,
+) -> dict[str, Any]:
+    """Sleep for the last N days: duration, score, stages, naps, overnight HRV/SpO2/
+    respiration/stress, bedtime and wake time, and Garmin's sleep need."""
+    dates = date_range_iso(days)
+    errors: ErrorList = []
+    raws = _fetch_days(dates, lambda d: _sleep_day(d, errors))
+    daily = [_normalize_sleep_day(day, raw) for day, raw in zip(dates, raws, strict=True)]
+
+    all_naps = [nap for d in daily for nap in d["naps"]]
+    latest_dto = (raws[0].get("dailySleepDTO") or {}) if raws else {}
+    return {
+        "period_days": len(dates),
+        "avg_hours": _mean([d["hours"] for d in daily], 2),
+        "avg_score": _mean([d["score"] for d in daily]),
+        "avg_deep_minutes": _mean([d["stages"]["deep"]["minutes"] for d in daily], 0),
+        "avg_rem_minutes": _mean([d["stages"]["rem"]["minutes"] for d in daily], 0),
+        "avg_overnight_hrv_ms": _mean([d["overnight_hrv_ms"] for d in daily]),
+        "avg_spo2": _mean([d["spo2"]["avg"] for d in daily]),
+        "avg_respiration": _mean([d["respiration"]["avg"] for d in daily]),
+        "nap_count": len(all_naps),
+        "total_nap_minutes": sum(d["nap_minutes"] or 0 for d in daily),
+        "next_sleep_need": _sleep_need(latest_dto.get("nextSleepNeed")),
+        "daily": daily,
+        **_errors_payload(errors),
+    }
+
+
+def get_resting_heart_rate(
+    days: Annotated[
+        int, Field(ge=1, le=MAX_DAYS_HEALTH, description="Lookback window in days.")
+    ] = 30,
+) -> dict[str, Any]:
+    """Daily resting heart rate with 7-day and 30-day trend summaries, up to 30 days."""
+    safe_days = max(1, min(days, MAX_DAYS_HEALTH))
+    dates = date_range_iso(safe_days)
+    errors: ErrorList = []
+    daily = []
+    for day, raw in zip(dates, _fetch_days(dates, lambda d: _rhr_day(d, errors)), strict=True):
+        daily.append({"date": day, "bpm": _extract_resting_heart_rate_bpm(raw)})
+
+    values = [item["bpm"] for item in daily if isinstance(item.get("bpm"), int)]
+    week_values = [item["bpm"] for item in daily[:7] if isinstance(item.get("bpm"), int)]
+    month_values = [item["bpm"] for item in daily[:30] if isinstance(item.get("bpm"), int)]
+    latest = next((item for item in daily if isinstance(item.get("bpm"), int)), None)
+    latest_bpm = latest["bpm"] if latest else None
+    weekly_avg = _avg(week_values)
+    monthly_avg = _avg(month_values)
+
+    return {
+        "period_days": safe_days,
+        "latest": latest,
+        "latest_bpm": latest_bpm,
+        "weekly_avg_bpm": weekly_avg,
+        "monthly_avg_bpm": monthly_avg,
+        "min_bpm": min(values) if values else None,
+        "max_bpm": max(values) if values else None,
+        "delta_latest_vs_weekly_avg_bpm": round_number(latest_bpm - weekly_avg, 1)
+        if isinstance(latest_bpm, int) and isinstance(weekly_avg, (int, float))
+        else None,
+        "delta_latest_vs_monthly_avg_bpm": round_number(latest_bpm - monthly_avg, 1)
+        if isinstance(latest_bpm, int) and isinstance(monthly_avg, (int, float))
+        else None,
+        "daily": daily,
+        **_errors_payload(errors),
+    }
+
+
+def get_stress(
+    days: Annotated[
+        int, Field(ge=1, le=MAX_DAYS_HEALTH, description="Lookback window in days.")
+    ] = 7,
+) -> dict[str, Any]:
+    """Daily all-day stress levels and stress duration buckets."""
+    dates = date_range_iso(days)
+    errors: ErrorList = []
+    daily = []
+    for day, raw in zip(dates, _fetch_days(dates, lambda d: _stress_day(d, errors)), strict=True):
+        daily.append(
+            {
+                "date": day,
+                "stress_avg": raw.get("avgStressLevel") or raw.get("overallStressLevel"),
+                "max_stress": raw.get("maxStressLevel"),
+                "rest_minutes": round_number((raw.get("restStressDuration") or 0) / 60, 1),
+                "low_minutes": round_number((raw.get("lowStressDuration") or 0) / 60, 1),
+                "medium_minutes": round_number((raw.get("mediumStressDuration") or 0) / 60, 1),
+                "high_minutes": round_number((raw.get("highStressDuration") or 0) / 60, 1),
+                "activity_minutes": round_number((raw.get("activityStressDuration") or 0) / 60, 1),
+            }
+        )
+    valid = [d["stress_avg"] for d in daily if isinstance(d.get("stress_avg"), (int, float))]
+    return {
+        "period_days": len(dates),
+        "period_avg_stress": round_number(sum(valid) / len(valid), 1) if valid else None,
+        "daily": daily,
+        **_errors_payload(errors),
+    }
+
+
+def _fetch_recent_activities(
+    days: int,
+    errors: ErrorList | None = None,
+    max_items: int = MAX_ACTIVITY_LIMIT,
+    start_date: str = "",
+    end_date: str = "",
+) -> list[dict[str, Any]]:
+    """Activities in a window. An explicit start_date/end_date wins over `days`."""
+    if start_date or end_date:
+        lower = start_date or "0000-01-01"
+        upper = end_date or today_iso()
+    else:
+        lower = date_range_iso(days)[-1]
+        upper = ""
+    activities = []
+    for item in _activities_paged(max_items, errors, stop_before=lower if start_date else None):
+        started = item.get("startTimeLocal") or ""
+        day = started[:10]
+        if not day or day < lower:
+            continue
+        if upper and day > upper:
+            continue
+        normalized = normalize_activity(item)
+        if normalized:
+            activities.append(normalized)
+    activities.sort(key=lambda item: item.get("date") or "", reverse=True)
+    return activities
+
+
+def _recent_activity_dates(days: int = 120, errors: ErrorList | None = None) -> list[str]:
+    dates: list[str] = []
+    cutoff = date_range_iso(days)[-1]
+    for item in _activities_raw(200, errors):
+        started = item.get("startTimeLocal") or ""
+        day = started[:10]
+        if not day or day < cutoff or day in dates:
+            continue
+        dates.append(day)
+    return dates
+
+
+def _supports_derived_metrics() -> bool:
+    """Whether the active backend can answer Garmin-derived metrics at all."""
+    return getattr(_client(), "supports_derived_metrics", True)
+
+
+def _latest_max_metrics(
+    errors: ErrorList | None = None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    if not _supports_derived_metrics():
+        return None, None
+    candidate_dates = [today_iso(), *_recent_activity_dates(errors=errors)]
+    seen: set[str] = set()
+    for day in candidate_dates:
+        if day in seen:
+            continue
+        seen.add(day)
+        raw = _max_metrics(day, errors)
+        item = raw[0] if isinstance(raw, list) and raw else raw
+        if isinstance(item, dict) and item:
+            return day, item
+    return None, None
+
+
+def get_recent_activities(
+    days: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=MAX_DAYS_ACTIVITIES,
+            description="How many days back to include. Ignored when start_date is given.",
+        ),
+    ] = 14,
+    limit: Annotated[
+        int,
+        Field(ge=1, le=MAX_ACTIVITY_LIMIT, description="Maximum number of activities to return."),
+    ] = 50,
+    start_date: Annotated[
+        str, Field(description="YYYY-MM-DD. Explicit window start (overrides days).")
+    ] = "",
+    end_date: Annotated[
+        str, Field(description="YYYY-MM-DD. Window end, inclusive. Defaults to today.")
+    ] = "",
+) -> dict[str, Any]:
+    """Recent Garmin activities with normalized sport-aware summary fields.
+
+    Pass start_date/end_date for a specific historical window (both inclusive);
+    otherwise the `days` lookback is used. Explicit dates make a past window
+    queryable without pulling every newer activity first.
+    """
+    safe_limit = max(1, min(limit, MAX_ACTIVITY_LIMIT))
+    safe_days = max(1, min(days, MAX_DAYS_ACTIVITIES))
+    errors: ErrorList = []
+
+    for name, value in (("start_date", start_date), ("end_date", end_date)):
+        if value and not _ISO_DATE_RE.match(value.strip()):
+            return {
+                "error": f"{name} must be YYYY-MM-DD",
+                "count": 0,
+                "activities": [],
+                **_errors_payload(errors),
+            }
+    if start_date and end_date and start_date.strip() > end_date.strip():
+        return {
+            "error": "start_date is after end_date",
+            "count": 0,
+            "activities": [],
+            **_errors_payload(errors),
+        }
+
+    explicit = bool(start_date or end_date)
+    activities = _fetch_recent_activities(
+        safe_days, errors, safe_limit, start_date.strip(), end_date.strip()
+    )
+    out: dict[str, Any] = {
+        "period_days": safe_days,
+        "count": min(len(activities), safe_limit),
+        "activities": activities[:safe_limit],
+    }
+    if explicit:
+        out["window"] = {
+            "start": start_date.strip() or date_range_iso(safe_days)[-1],
+            "end": end_date.strip() or today_iso(),
+        }
+    out.update(_errors_payload(errors))
+    return out
+
+
+def get_activity_detail(activity_id: int) -> dict[str, Any]:
+    """Detailed summary for one activity by Garmin activity ID, with weather and time in
+    heart-rate and power zones."""
+    client = _client()
+    manager = get_manager()
+    errors: ErrorList = []
+    raw = manager.cached(
+        f"activity_detail:{activity_id}",
+        lambda: manager.safe_call(
+            lambda: client.get_activity(activity_id),
+            default={},
+            errors=errors,
+            label=f"activity:{activity_id}",
+        ),
+    )
+    if not isinstance(raw, dict) or not raw:
+        return {
+            "activity_id": activity_id,
+            "error": "activity not found or inaccessible",
+            **_errors_payload(errors),
+        }
+    summary = raw.get("summaryDTO") or raw.get("summary") or raw
+    type_key = activity_type_key(raw)
+    return {
+        "activity_id": activity_id,
+        "name": raw.get("activityName") or summary.get("activityName"),
+        "sport": sport_bucket(type_key),
+        "type_key": type_key,
+        "summary": _without_gps(normalize_activity(summary) or summary),
+        "training_effect": {
+            "aerobic": summary.get("trainingEffect") or summary.get("aerobicTrainingEffect"),
+            "anaerobic": summary.get("anaerobicTrainingEffect"),
+            "label": summary.get("trainingEffectLabel"),
+            "aerobic_message": summary.get("aerobicTrainingEffectMessage"),
+            "anaerobic_message": summary.get("anaerobicTrainingEffectMessage"),
+        },
+        "weather": _activity_weather(activity_id, errors),
+        "hr_time_in_zones": _activity_time_in_zones(
+            activity_id, "hr", lambda: client.get_activity_hr_in_timezones(activity_id), errors
+        ),
+        "power_time_in_zones": _activity_time_in_zones(
+            activity_id,
+            "power",
+            lambda: client.get_activity_power_in_timezones(activity_id),
+            errors,
+        ),
+        "raw_keys": sorted(raw.keys())[:80],
+        **_errors_payload(errors),
+    }
+
+
+def _minutes_to_hours(value: Any) -> float | None:
+    """Garmin's recoveryTime is in MINUTES; the field we expose is in hours (issue #3)."""
+    minutes = _number(value)
+    return round(minutes / 60, 1) if minutes is not None else None
+
+
+def _number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _normalize_lap(lap: dict[str, Any], index: int) -> dict[str, Any]:
+    """Normalize one Garmin lap/split entry. Missing values stay null, never 0."""
+    distance_m = _number(lap.get("distance"))
+    duration_s = _number(lap.get("duration"))
+    if duration_s is None:
+        duration_s = _number(lap.get("movingDuration"))
+    speed = _number(lap.get("averageSpeed"))
+    if speed is None:
+        speed = _number(lap.get("averageMovingSpeed"))
+    pace_seconds = 1000.0 / speed if speed and speed > 0 else None
+    if pace_seconds is None and distance_m and duration_s and distance_m > 0:
+        pace_seconds = duration_s / (distance_m / 1000)
+    hr_avg = _number(lap.get("averageHR"))
+    hr_max = _number(lap.get("maxHR"))
+    cadence = _number(
+        lap.get("averageRunCadence")
+        or lap.get("averageRunningCadenceInStepsPerMinute")
+        or lap.get("averageBikingCadenceInRevPerMinute")
+    )
+    return {
+        "index": index,
+        "distance_km": round_number(distance_m / 1000, 2) if distance_m is not None else None,
+        "duration": format_duration(duration_s),
+        "duration_seconds": int(duration_s) if duration_s is not None else None,
+        "pace": _format_pace(pace_seconds),
+        "pace_seconds_per_km": round_number(pace_seconds, 1),
+        "hr_avg": int(hr_avg) if hr_avg is not None else None,
+        "hr_max": int(hr_max) if hr_max is not None else None,
+        "cadence": round_number(cadence, 0),
+        "elevation_gain_m": round_number(_number(lap.get("elevationGain")), 1),
+    }
+
+
+def _hr_drift(laps: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, str | None]:
+    """Compare first-half to second-half average HR. Returns (drift, unavailable_reason)."""
+    if len(laps) < 4:
+        return None, f"needs at least 4 laps, got {len(laps)}"
+    hr_values = [lap.get("hr_avg") for lap in laps]
+    if any(not isinstance(value, (int, float)) for value in hr_values):
+        return None, "not every lap reports an average heart rate"
+    middle = len(laps) // 2
+    first_avg = sum(hr_values[:middle]) / middle
+    second_avg = sum(hr_values[middle:]) / (len(laps) - middle)
+    if first_avg <= 0:
+        return None, "first-half average heart rate is not usable"
+    drift_pct = (second_avg - first_avg) / first_avg * 100
+    if drift_pct <= 3:
+        interpretation = "stabil"
+    elif drift_pct <= 5:
+        interpretation = "drift ringan"
+    else:
+        interpretation = "drift tinggi (cari penyebab: panas/dehidrasi/kelelahan)"
+    return {
+        "first_half_avg_hr": round_number(first_avg, 0),
+        "second_half_avg_hr": round_number(second_avg, 0),
+        "drift_pct": round(drift_pct, 1),
+        "interpretation": interpretation,
+    }, None
+
+
+def get_activity_splits(activity_id: int) -> dict[str, Any]:
+    """Per-lap splits for one activity: pace, HR, cadence, elevation and HR drift."""
+    client = _client()
+    manager = get_manager()
+    errors: ErrorList = []
+    raw = manager.cached(
+        f"activity_splits:{activity_id}",
+        lambda: manager.safe_call(
+            lambda: client.get_activity_splits(activity_id),
+            default={},
+            errors=errors,
+            label=f"splits:{activity_id}",
+        ),
+    )
+    lap_dtos = raw.get("lapDTOs") if isinstance(raw, dict) else None
+    if not isinstance(lap_dtos, list):
+        return {
+            "activity_id": activity_id,
+            "error": "splits not found or inaccessible",
+            **_errors_payload(errors),
+        }
+    laps = [
+        _normalize_lap(lap, index)
+        for index, lap in enumerate(lap_dtos, start=1)
+        if isinstance(lap, dict)
+    ]
+    if not laps:
+        return {
+            "activity_id": activity_id,
+            "error": "splits not found or inaccessible",
+            **_errors_payload(errors),
+        }
+
+    distances = [lap["distance_km"] for lap in laps]
+    durations = [lap["duration_seconds"] for lap in laps]
+    total_distance_km = (
+        round_number(sum(distances), 2) if all(value is not None for value in distances) else None
+    )
+    total_seconds = sum(durations) if all(value is not None for value in durations) else None
+    hr_pairs = [
+        (lap["hr_avg"], lap["duration_seconds"]) for lap in laps if lap["hr_avg"] is not None
+    ]
+    if not hr_pairs:
+        avg_hr = None
+    elif all(seconds for _, seconds in hr_pairs):
+        weight = sum(seconds for _, seconds in hr_pairs)
+        avg_hr = round_number(sum(hr * seconds for hr, seconds in hr_pairs) / weight, 0)
+    else:
+        avg_hr = round_number(sum(hr for hr, _ in hr_pairs) / len(hr_pairs), 0)
+    cadences = [lap["cadence"] for lap in laps if lap["cadence"] is not None]
+    elevations = [lap["elevation_gain_m"] for lap in laps if lap["elevation_gain_m"] is not None]
+    hr_drift, hr_drift_note = _hr_drift(laps)
+    summary = {
+        "distance_km": total_distance_km,
+        "duration": format_duration(total_seconds),
+        "avg_pace": _format_pace(total_seconds / total_distance_km)
+        if total_seconds and total_distance_km
+        else None,
+        "avg_hr": avg_hr,
+        "avg_cadence": round_number(sum(cadences) / len(cadences), 0) if cadences else None,
+        "elevation_gain_m": round_number(sum(elevations), 1) if elevations else None,
+    }
+    origin = {}
+    if isinstance(raw, dict):
+        for key in ("lap_source", "note"):
+            if raw.get(key):
+                origin[key] = raw[key]
+    return {
+        "activity_id": activity_id,
+        "lap_count": len(laps),
+        "laps": laps,
+        "summary": summary,
+        "hr_drift": hr_drift,
+        **({"hr_drift_note": hr_drift_note} if hr_drift_note else {}),
+        **origin,
+        **_errors_payload(errors),
+    }
+
+
+def _run_activities(days: int, errors: ErrorList | None = None) -> list[dict[str, Any]]:
+    return [
+        activity
+        for activity in _fetch_recent_activities(days, errors)
+        if activity.get("sport") == "run"
+    ]
+
+
+def _pace_seconds_from_activity(activity: dict[str, Any]) -> float | None:
+    distance = activity.get("distance_km")
+    duration = activity.get("duration_min")
+    if not isinstance(distance, (int, float)) or not isinstance(duration, (int, float)):
+        return None
+    if distance <= 0 or duration <= 0:
+        return None
+    return (duration * 60) / distance
+
+
+def _format_pace(seconds_per_km: float | None) -> str | None:
+    if seconds_per_km is None:
+        return None
+    minutes = int(seconds_per_km // 60)
+    seconds = int(seconds_per_km % 60)
+    return f"{minutes}:{seconds:02d}/km"
+
+
+def _month_key(activity: dict[str, Any]) -> str:
+    date_value = activity.get("date") or ""
+    return str(date_value)[:7] if date_value else "unknown"
+
+
+def get_running_summary(
+    days: Annotated[
+        int, Field(ge=1, le=MAX_DAYS_ACTIVITIES, description="Lookback window in days.")
+    ] = 90,
+) -> dict[str, Any]:
+    """Running summary: sessions, distance, pace, HR, longest run, fastest run, monthly split."""
+    safe_days = max(1, min(days, MAX_DAYS_ACTIVITIES))
+    errors: ErrorList = []
+    runs = _run_activities(safe_days, errors)
+    total_distance = sum(activity.get("distance_km") or 0 for activity in runs)
+    total_minutes = sum(activity.get("duration_min") or 0 for activity in runs)
+    hr_values = [
+        activity["hr_avg"] for activity in runs if isinstance(activity.get("hr_avg"), (int, float))
+    ]
+    longest = max(runs, key=lambda activity: activity.get("distance_km") or 0, default=None)
+    paced_runs = [
+        (activity, _pace_seconds_from_activity(activity))
+        for activity in runs
+        if _pace_seconds_from_activity(activity) is not None
+    ]
+    fastest = min(paced_runs, key=lambda item: item[1] or 999999, default=(None, None))[0]
+    return {
+        "period_days": safe_days,
+        "sessions": len(runs),
+        "total_distance_km": round_number(total_distance, 2),
+        "total_duration_hours": round_number(total_minutes / 60, 2),
+        "average_pace": _format_pace((total_minutes * 60) / total_distance)
+        if total_distance
+        else None,
+        "average_hr": round_number(sum(hr_values) / len(hr_values), 0) if hr_values else None,
+        "longest_run": _compact_activity(longest),
+        "fastest_run": _compact_activity(fastest),
+        "monthly": get_monthly_running_stats(months=max(1, min(12, (safe_days + 30) // 31)))[
+            "months"
+        ],
+        **_errors_payload(errors),
+    }
+
+
+def get_monthly_running_stats(
+    months: Annotated[
+        int, Field(ge=1, le=12, description="How many recent months to summarize.")
+    ] = 3,
+) -> dict[str, Any]:
+    """Monthly running stats for the last N calendar-ish months based on recent activities."""
+    safe_months = max(1, min(months, 12))
+    errors: ErrorList = []
+    runs = _run_activities(safe_months * 31, errors)
+    buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for run in runs:
+        buckets[_month_key(run)].append(run)
+    months_out = []
+    for month in sorted(buckets.keys(), reverse=True)[:safe_months]:
+        items = buckets[month]
+        distance = sum(item.get("distance_km") or 0 for item in items)
+        minutes = sum(item.get("duration_min") or 0 for item in items)
+        hr_values = [
+            item["hr_avg"] for item in items if isinstance(item.get("hr_avg"), (int, float))
+        ]
+        months_out.append(
+            {
+                "month": month,
+                "sessions": len(items),
+                "total_distance_km": round_number(distance, 2),
+                "total_duration_hours": round_number(minutes / 60, 2),
+                "average_pace": _format_pace((minutes * 60) / distance) if distance else None,
+                "average_hr": round_number(sum(hr_values) / len(hr_values), 0)
+                if hr_values
+                else None,
+            }
+        )
+    return {"months_requested": safe_months, "months": months_out, **_errors_payload(errors)}
+
+
+def _compact_activity(activity: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not activity:
+        return None
+    return {
+        "activity_id": activity.get("activity_id"),
+        "name": activity.get("name"),
+        "date": activity.get("date"),
+        "distance_km": activity.get("distance_km"),
+        "duration": activity.get("duration"),
+        "pace": _format_pace(_pace_seconds_from_activity(activity)),
+        "hr_avg": activity.get("hr_avg"),
+    }
+
+
+def get_recent_load(
+    days: Annotated[
+        int, Field(ge=1, le=MAX_DAYS_ACTIVITIES, description="Lookback window in days.")
+    ] = 28,
+) -> dict[str, Any]:
+    """Training volume aggregated by sport over the last N days."""
+    safe_days = max(1, min(days, MAX_DAYS_ACTIVITIES))
+    errors: ErrorList = []
+    activities = _fetch_recent_activities(safe_days, errors, MAX_ACTIVITY_LIMIT)
+    buckets: dict[str, dict[str, Any]] = {}
+    for activity in activities:
+        sport = activity.get("sport") or "other"
+        bucket = buckets.setdefault(
+            sport, {"sessions": 0, "total_km": 0.0, "total_minutes": 0.0, "hr_sum": 0, "hr_n": 0}
+        )
+        bucket["sessions"] += 1
+        bucket["total_km"] += activity.get("distance_km") or 0
+        bucket["total_minutes"] += activity.get("duration_min") or 0
+        if isinstance(activity.get("hr_avg"), (int, float)):
+            bucket["hr_sum"] += activity["hr_avg"]
+            bucket["hr_n"] += 1
+    by_sport = {}
+    for sport, bucket in buckets.items():
+        by_sport[sport] = {
+            "sessions": bucket["sessions"],
+            "total_km": round_number(bucket["total_km"], 2),
+            "total_minutes": round_number(bucket["total_minutes"], 1),
+            "total_hours": round_number(bucket["total_minutes"] / 60, 2),
+            "avg_hr": round_number(bucket["hr_sum"] / bucket["hr_n"], 0)
+            if bucket["hr_n"]
+            else None,
+        }
+    return {"period_days": safe_days, "by_sport": by_sport, **_errors_payload(errors)}
+
+
+def get_training_load() -> dict[str, Any]:
+    """Garmin training load status, acute/chronic load, and load focus."""
+    today = today_iso()
+    errors: ErrorList = []
+    raw = _training_status(today, errors)
+    if not raw:
+        return {
+            "date": today,
+            "source": "garmin_training_status",
+            "available": False,
+            "reason": "training status endpoint returned no data",
+            **_errors_payload(errors),
+        }
+
+    acute = chronic = ratio = status = None
+    load_balance = raw.get("mostRecentTrainingLoadBalance")
+    if isinstance(load_balance, dict):
+        acute = round_number(
+            load_balance.get("acuteTrainingLoad")
+            or load_balance.get("dailyTrainingLoadAcute")
+            or load_balance.get("load")
+            or load_balance.get("trainingLoad"),
+            1,
+        )
+        chronic = round_number(
+            load_balance.get("chronicTrainingLoad") or load_balance.get("dailyTrainingLoadChronic"),
+            1,
+        )
+        ratio = round_number(
+            load_balance.get("acuteChronicWorkloadRatio")
+            or load_balance.get("dailyAcuteChronicWorkloadRatio"),
+            2,
+        )
+        status = load_balance.get("acwrStatus") or load_balance.get("loadStatus")
+
+    latest_map = (raw.get("mostRecentTrainingStatus") or {}).get("latestTrainingStatusData") or {}
+    if latest_map:
+        first = next(iter(latest_map.values()))
+        if isinstance(first, dict):
+            atl = first.get("acuteTrainingLoadDTO") or {}
+            acute = acute or round_number(atl.get("dailyTrainingLoadAcute"), 1)
+            chronic = chronic or round_number(atl.get("dailyTrainingLoadChronic"), 1)
+            ratio = ratio or round_number(atl.get("dailyAcuteChronicWorkloadRatio"), 2)
+            status = status or atl.get("acwrStatus")
+
+    return {
+        "date": today,
+        "source": "garmin_training_status",
+        "available": any(value is not None for value in [acute, chronic, ratio, status]),
+        "acute_load": acute,
+        "chronic_load": chronic,
+        "load_ratio": ratio,
+        "acwr_status": status,
+        "raw_sections_present": {
+            "mostRecentTrainingLoadBalance": raw.get("mostRecentTrainingLoadBalance") is not None,
+            "mostRecentTrainingStatus": raw.get("mostRecentTrainingStatus") is not None,
+        },
+        **_errors_payload(errors),
+    }
+
+
+def get_fitness() -> dict[str, Any]:
+    """VO2 max, cycling FTP, and race predictions."""
+    client = _client()
+    manager = get_manager()
+    errors: ErrorList = []
+    race_raw = manager.cached(
+        "race_predictions",
+        lambda: manager.safe_call(
+            lambda: client.get_race_predictions(),
+            default=None,
+            errors=errors,
+            label="race_predictions",
+        ),
+    )
+    ftp_raw = manager.cached(
+        "cycling_ftp",
+        lambda: manager.safe_call(
+            lambda: client.get_cycling_ftp(),
+            default=None,
+            errors=errors,
+            label="cycling_ftp",
+        ),
+    )
+
+    vo2_run = vo2_bike = None
+    metrics_date, item = _latest_max_metrics(errors)
+    if isinstance(item, dict):
+        generic = item.get("generic") or {}
+        cycling = item.get("cycling") or {}
+        vo2_run = round_number(generic.get("vo2MaxPreciseValue") or generic.get("vo2MaxValue"), 1)
+        vo2_bike = round_number(cycling.get("vo2MaxPreciseValue") or cycling.get("vo2MaxValue"), 1)
+
+    race_item = race_raw[-1] if isinstance(race_raw, list) and race_raw else race_raw
+    race = {}
+    if isinstance(race_item, dict):
+        for key_in, key_out in [
+            ("time5K", "5k"),
+            ("time10K", "10k"),
+            ("timeHalfMarathon", "half_marathon"),
+            ("timeMarathon", "marathon"),
+        ]:
+            seconds = race_item.get(key_in)
+            if isinstance(seconds, (int, float)) and seconds > 0:
+                race[key_out] = {"seconds": int(seconds)}
+
+    return {
+        "metrics_date": metrics_date,
+        "vo2_max_running": vo2_run,
+        "vo2_max_cycling": vo2_bike,
+        "cycling_ftp_w": ftp_raw.get("functionalThresholdPower")
+        if isinstance(ftp_raw, dict)
+        else ftp_raw,
+        "race_predictions": race or None,
+        **_errors_payload(errors),
+    }
+
+
+def get_zones() -> dict[str, Any]:
+    """Heart-rate zones (bpm ranges per sport, with max/resting/threshold HR used),
+    running power zones, and thresholds from Garmin user settings."""
+    client = _client()
+    errors: ErrorList = []
+    raw = _endpoint(
+        "user_profile",
+        "user_profile",
+        lambda: client.get_user_profile(),
+        {},
+        errors,
+    )
+    user_data = raw.get("userData") if isinstance(raw, dict) else None
+    zones: dict[str, Any] = {}
+    if isinstance(user_data, dict):
+        for key, value in user_data.items():
+            if not isinstance(key, str) or value in (None, [], {}):
+                continue
+            if _ZONE_KEY_RE.search(key):
+                zones[key] = value
+    hr_raw = _endpoint("heart_rate_zones", "heart_rate_zones",
+                       lambda: client.get_heart_rate_zones(), [], errors)
+    power_raw = _endpoint("power_zones:RUNNING", "power_zones:running",
+                          lambda: client.get_power_zones_for_sport("RUNNING"), {}, errors)
+    hr_zones = _hr_zone_sets(hr_raw)
+    power_zones = _power_zone_set(power_raw)
+    available = bool(zones or hr_zones)
+    return {
+        "available": available,
+        "source": "garmin_user_settings",
+        "zones": zones or None,
+        "heart_rate_zones": hr_zones,
+        "running_power_zones": power_zones,
+        "reason": None if available
+        else "user settings did not expose zone data for this account",
+        **_errors_payload(errors),
+    }
+
+
+def get_personal_records() -> dict[str, Any]:
+    """Personal records returned by Garmin Connect."""
+    client = _client()
+    manager = get_manager()
+    errors: ErrorList = []
+    getter = getattr(client, "get_personal_record", None) or getattr(
+        client, "get_personal_records", None
+    )
+    if getter is None:
+        return {
+            "count": 0,
+            "records": [],
+            "available": False,
+            "reason": "garminconnect client does not expose a personal records endpoint",
+        }
+    raw = manager.cached(
+        "personal_records",
+        lambda: manager.safe_call(getter, default=[], errors=errors, label="personal_records"),
+    )
+    if isinstance(raw, dict):
+        raw = (
+            raw.get("personalRecords")
+            or raw.get("userPersonalRecords")
+            or raw.get("records")
+            or raw.get("prRecords")
+            or []
+        )
+    type_map = _personal_record_type_map(client, manager)
+    records = []
+    if isinstance(raw, list):
+        for record in raw:
+            if not isinstance(record, dict):
+                continue
+            type_id = _personal_record_type_id(record.get("typeId"))
+            type_info = type_map.get(type_id) if type_id is not None else None
+            label_key = (
+                _personal_record_label_key(record.get("prTypeLabelKey"))
+                or _personal_record_label_key(record.get("typeLabelKey"))
+                or _personal_record_label_key(type_info)
+            )
+            label = _personal_record_label(label_key, type_id)
+            records.append(
+                {
+                    "type_id": type_id,
+                    "name": label,
+                    "label": label,
+                    "label_key": label_key,
+                    "sport": type_info.get("sport") if isinstance(type_info, dict) else None,
+                    "value": record.get("value"),
+                    "value_unit": _personal_record_value_unit(label),
+                    "date": record.get("prStartTimeGmtFormatted") or record.get("prStartTimeGmt"),
+                }
+            )
+    return {"count": len(records), "records": records, "available": True, **_errors_payload(errors)}
+
+
+def get_hrv_history(
+    days: Annotated[
+        int, Field(ge=1, le=MAX_DAYS_HEALTH, description="Lookback window in days.")
+    ] = 30,
+) -> dict[str, Any]:
+    """Daily HRV (last-night and weekly average) plus a baseline.
+
+    get_recovery carries only a 7-day HRV window, which is fine for "how am I today"
+    but useless for trend questions. This is the same data over a longer range.
+    `daily` is newest-first, like every other daily array here.
+    """
+    safe_days = max(1, min(days, MAX_DAYS_HEALTH))
+    dates = date_range_iso(safe_days)
+    errors: ErrorList = []
+    daily = []
+    for day, raw in zip(dates, _fetch_days(dates, lambda d: _hrv_day(d, errors)), strict=True):
+        summary = raw.get("hrvSummary") if isinstance(raw, dict) else None
+        if not isinstance(summary, dict):
+            continue
+        if summary.get("lastNightAvg") is None and summary.get("weeklyAvg") is None:
+            continue
+        daily.append(
+            {
+                "date": day,
+                "last_night_avg_ms": summary.get("lastNightAvg"),
+                "weekly_avg_ms": summary.get("weeklyAvg"),
+                "status": summary.get("status"),
+            }
+        )
+
+    values = [
+        entry["last_night_avg_ms"]
+        for entry in daily
+        if isinstance(entry.get("last_night_avg_ms"), (int, float))
+    ]
+    baseline = round_number(sum(values) / len(values), 1) if values else None
+    latest = values[-1] if values else None
+    return {
+        "period_days": safe_days,
+        "days_with_data": len(daily),
+        "baseline_avg_ms": baseline,
+        "latest_ms": latest,
+        "delta_vs_baseline_ms": round_number(latest - baseline, 1)
+        if latest is not None and baseline is not None
+        else None,
+        "daily": daily,
+        **_errors_payload(errors),
+    }
+
+
+def get_body_battery_range(
+    days: Annotated[
+        int, Field(ge=1, le=MAX_DAYS_HEALTH, description="Lookback window in days.")
+    ] = 7,
+) -> dict[str, Any]:
+    """Daily body battery (charged, drained, highest, lowest, end of day).
+
+    get_recovery only exposes today's levels; this walks the range endpoint so the
+    history is available for trends. The raw per-timestamp arrays are summarised away
+    because they are large and rarely useful. `daily` is newest-first, like every other
+    daily array here.
+    """
+    safe_days = max(1, min(days, MAX_DAYS_HEALTH))
+    dates = date_range_iso(safe_days)
+    errors: ErrorList = []
+    # date_range_iso() is newest-first, so the API range is (oldest, newest).
+    raw = _body_battery(dates[-1], dates[0], errors)
+
+    daily = []
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            day = str(item.get("date") or "")[:10]
+            if not day:
+                continue
+            daily.append(
+                {
+                    "date": day,
+                    "charged": item.get("charged"),
+                    "drained": item.get("drained"),
+                    "highest": item.get("highestBatteryLevel") or item.get("highest"),
+                    "lowest": item.get("lowestBatteryLevel") or item.get("lowest"),
+                    "end_of_day": item.get("endOfDayBatteryLevel"),
+                }
+            )
+    # Match the rest of the tools: daily arrays are newest-first.
+    daily.sort(key=lambda entry: entry["date"], reverse=True)
+
+    return {
+        "period_days": safe_days,
+        "days_with_data": len(daily),
+        "daily": daily,
+        **_errors_payload(errors),
+    }
+
+
+def get_health_summary(
+    days: Annotated[
+        int, Field(ge=1, le=MAX_DAYS_HEALTH, description="Lookback window in days.")
+    ] = 7,
+) -> dict[str, Any]:
+    """Compact health snapshot combining recovery, sleep, and stress."""
+    return {
+        "date": today_iso(),
+        "recovery": get_recovery(),
+        "sleep": get_sleep(days),
+        "resting_heart_rate": get_resting_heart_rate(min(max(days, 1), MAX_DAYS_HEALTH)),
+        "stress": get_stress(days),
+    }
+
+
+def get_full_snapshot(
+    activity_days: Annotated[
+        int, Field(ge=1, le=MAX_DAYS_ACTIVITIES, description="Activity window in days.")
+    ] = 14,
+    load_days: Annotated[
+        int, Field(ge=1, le=MAX_DAYS_ACTIVITIES, description="Training load window in days.")
+    ] = 28,
+) -> dict[str, Any]:
+    """Comprehensive Garmin data snapshot for holistic analysis.
+
+    Every section carries a ``data_source`` field naming the backend that
+    answered it (`personal`, `unofficial`, or `personal+unofficial` when one
+    section needed both — with the per-endpoint map in ``source_detail``). In
+    hybrid mode this makes it visible which numbers are official-API data and
+    which came from the derived-metrics backend, instead of hiding a fallback.
+    (``data_source`` rather than ``source``: some sections already use ``source``
+    for their own provenance string, e.g. ``garmin_training_status``.)
+    """
+    manager = get_manager()
+    sections: dict[str, Callable[[], dict[str, Any]]] = {
+        "recovery": get_recovery,
+        "sleep": lambda: get_sleep(7),
+        "resting_heart_rate": lambda: get_resting_heart_rate(30),
+        "stress": lambda: get_stress(7),
+        "recent_activities": lambda: get_recent_activities(activity_days),
+        "recent_load": lambda: get_recent_load(load_days),
+        "training_load": get_training_load,
+        "fitness": get_fitness,
+        "running_summary": lambda: get_running_summary(activity_days),
+        "zones": get_zones,
+        "personal_records": get_personal_records,
+    }
+    out: dict[str, Any] = {
+        "snapshot_date": today_iso(),
+        "auth_backend": manager.backend,
+        "activity_window_days": activity_days,
+        "load_window_days": load_days,
+    }
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futures = {
+            name: ex.submit(_section_with_source, fn, manager.backend)
+            for name, fn in sections.items()
+        }
+        for name, future in futures.items():
+            out[name] = future.result()
+
+    out["section_sources"] = {
+        name: section.get("data_source")
+        for name, section in out.items()
+        if isinstance(section, dict) and section.get("data_source")
+    }
+    mixed = sorted(
+        name for name, source in out["section_sources"].items() if source == "personal+unofficial"
+    )
+    out["hybrid_fallbacks"] = mixed
+    return out
+
+
+def _section_with_source(
+    fn: Callable[[], dict[str, Any]], backend: str
+) -> dict[str, Any]:
+    """Run one snapshot section and tag it with the backend(s) that answered."""
+    from .hybrid import capture_call
+
+    try:
+        payload, sources = capture_call(fn)
+    except Exception as exc:  # noqa: BLE001 - one bad section must not kill the snapshot
+        return {"error": f"{type(exc).__name__}: {exc}", "data_source": backend}
+    if not isinstance(payload, dict):
+        return payload
+    used = sorted(set(sources.values()))
+    if not used:
+        payload.setdefault("data_source", backend)
+    elif len(used) == 1:
+        payload.setdefault("data_source", used[0])
+    else:
+        payload.setdefault("data_source", "personal+unofficial")
+        payload.setdefault("source_detail", dict(sorted(sources.items())))
+    return payload
+
+
+def _safe_section(fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    try:
+        return fn()
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+# ---------------------------------------------------------------------------
+# Personal API only tools
+#
+# These use endpoints that exist in the official Garmin Personal API but have no
+# equivalent in the unofficial email/password flow, so they are unavailable on
+# GARMIN_AUTH_MODE=unofficial. See docs/personal-api.md.
+# ---------------------------------------------------------------------------
+
+_PERSONAL_ONLY_HINT = (
+    "This tool needs the official Garmin Personal API. Set GARMIN_PERSONAL_API_KEY "
+    "(create one at https://connect.garmin.com/app/auth/settings/personalApiToken) and "
+    "GARMIN_AUTH_MODE=personal, then restart the server. See docs/personal-api.md."
+)
+
+
+def _personal_only_error() -> dict[str, Any] | None:
+    manager = get_manager()
+    if manager.backend in {"personal", "hybrid", "demo"}:
+        return None
+    return {
+        "error": "personal api required",
+        "backend": manager.backend,
+        "hint": _PERSONAL_ONLY_HINT,
+    }
+
+
+def _rows(payload: Any, *keys: str) -> list[dict[str, Any]]:
+    """Pull the first list-of-dicts out of a payload, trying known envelope keys."""
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def get_body_composition(
+    days: Annotated[
+        int, Field(ge=1, le=MAX_DAYS_HEALTH, description="Lookback window in days.")
+    ] = 30,
+) -> dict[str, Any]:
+    """Weight (and body fat/muscle when the scale reports it) from Garmin Connect.
+
+    Personal API only. Weight is what most fitness decisions here hinge on, and
+    the unofficial flow never exposed it as a tool.
+    """
+    blocked = _personal_only_error()
+    if blocked:
+        return blocked
+    client = _client()
+    dates = date_range_iso(max(1, min(days, MAX_DAYS_HEALTH)))
+    errors: ErrorList = []
+    raw = _endpoint(
+        f"body_composition:{dates[-1]}:{dates[0]}",
+        "body_composition",
+        lambda: client.get_body_composition(dates[-1], dates[0]),
+        {},
+        errors,
+    )
+    rows = _rows(raw, "dateWeightList", "dailyWeightSummaries", "allWeightMetrics", "weights")
+    daily = []
+    for item in rows:
+        day = str(
+            item.get("calendarDate")
+            or item.get("date")
+            or item.get("summaryDate")
+            or item.get("timestampGMT")
+            or ""
+        )[:10]
+        if not day:
+            continue
+        weight_g = item.get("weight")
+        weight_kg = (
+            round_number(weight_g / 1000, 2)
+            if isinstance(weight_g, (int, float)) and weight_g > 0
+            else round_number(item.get("weightKg"), 2)
+        )
+        daily.append(
+            {
+                "date": day,
+                "weight_kg": weight_kg,
+                "bmi": round_number(item.get("bmi"), 1),
+                "body_fat_pct": round_number(item.get("bodyFat"), 1),
+                "body_muscle_kg": round_number(
+                    item.get("muscleMass") / 1000
+                    if isinstance(item.get("muscleMass"), (int, float))
+                    else None,
+                    2,
+                ),
+                "body_water_pct": round_number(item.get("bodyWater"), 1),
+            }
+        )
+    daily.sort(key=lambda entry: entry["date"], reverse=True)
+    weights = [
+        entry["weight_kg"] for entry in daily if isinstance(entry["weight_kg"], (int, float))
+    ]
+    return {
+        "period_days": len(dates),
+        "days_with_data": len(daily),
+        "avg_weight_kg": round_number(sum(weights) / len(weights), 2) if weights else None,
+        "latest_weight_kg": daily[0]["weight_kg"] if daily else None,
+        "daily": daily,
+        **_errors_payload(errors),
+    }
+
+
+def get_spo2(
+    days: Annotated[
+        int, Field(ge=1, le=MAX_DAYS_HEALTH, description="Lookback window in days.")
+    ] = 7,
+) -> dict[str, Any]:
+    """Blood oxygen (SpO2) acclimation per day. Personal API only."""
+    blocked = _personal_only_error()
+    if blocked:
+        return blocked
+    client = _client()
+    errors: ErrorList = []
+    daily = []
+    for day in date_range_iso(max(1, min(days, MAX_DAYS_HEALTH))):
+        raw = _endpoint(
+            f"spo2:{day}",
+            f"spo2:{day}",
+            lambda day=day: client.get_spo2(day),
+            {},
+            errors,
+        )
+        if not isinstance(raw, dict) or not raw:
+            daily.append({"date": day, "avg_spo2": None, "lowest_spo2": None})
+            continue
+        daily.append(
+            {
+                "date": day,
+                "avg_spo2": round_number(raw.get("averageSpO2") or raw.get("avgSpO2"), 1),
+                "lowest_spo2": round_number(raw.get("lowestSpO2"), 1),
+                "latest_spo2": round_number(raw.get("latestSpO2"), 1),
+            }
+        )
+    values = [entry["avg_spo2"] for entry in daily if isinstance(entry["avg_spo2"], (int, float))]
+    return {
+        "period_days": len(daily),
+        "avg_spo2": round_number(sum(values) / len(values), 1) if values else None,
+        "daily": daily,
+        **_errors_payload(errors),
+    }
+
+
+def get_hydration(
+    days: Annotated[
+        int, Field(ge=1, le=MAX_DAYS_HEALTH, description="Lookback window in days.")
+    ] = 7,
+) -> dict[str, Any]:
+    """Logged daily fluid intake in millilitres. Personal API only."""
+    blocked = _personal_only_error()
+    if blocked:
+        return blocked
+    client = _client()
+    dates = date_range_iso(max(1, min(days, MAX_DAYS_HEALTH)))
+    errors: ErrorList = []
+    raw = _endpoint(
+        f"hydration:{dates[-1]}:{dates[0]}",
+        "hydration",
+        lambda: client.get_hydration(dates[-1], dates[0]),
+        {},
+        errors,
+    )
+    daily = []
+    for item in _rows(raw, "hydrationValues", "dailyHydration", "hydration"):
+        day = str(item.get("calendarDate") or item.get("date") or "")[:10]
+        if not day:
+            continue
+        value = item.get("valueInML") or item.get("value") or item.get("amountInML")
+        goal = item.get("goalInML") or item.get("goal")
+        daily.append(
+            {
+                "date": day,
+                "intake_ml": round_number(value, 0) if isinstance(value, (int, float)) else None,
+                "goal_ml": round_number(goal, 0) if isinstance(goal, (int, float)) else None,
+            }
+        )
+    daily.sort(key=lambda entry: entry["date"], reverse=True)
+    return {
+        "period_days": len(dates),
+        "days_with_data": len(daily),
+        "daily": daily,
+        **_errors_payload(errors),
+    }
+
+
+def get_fitness_age() -> dict[str, Any]:
+    """Garmin's fitness age for today. Personal API only."""
+    blocked = _personal_only_error()
+    if blocked:
+        return blocked
+    client = _client()
+    manager = get_manager()
+    errors: ErrorList = []
+    raw = manager.cached(
+        f"fitness_age:{today_iso()}",
+        lambda: manager.safe_call(
+            client.get_fitness_age,
+            default={},
+            errors=errors,
+            label="fitness_age",
+        ),
+    )
+    if not isinstance(raw, dict) or not raw:
+        return {"error": "fitness age not available", **_errors_payload(errors)}
+    return {
+        "date": today_iso(),
+        "fitness_age": raw.get("fitnessAge") or raw.get("chronologicalAge"),
+        "chronological_age": raw.get("chronologicalAge"),
+        "achievable_fitness_age": raw.get("achievableFitnessAge"),
+        "previous_fitness_age": raw.get("previousFitnessAge"),
+        **_errors_payload(errors),
+    }
+
+
+def get_steps_history(
+    days: Annotated[
+        int, Field(ge=1, le=MAX_DAYS_HEALTH, description="Lookback window in days.")
+    ] = 7,
+) -> dict[str, Any]:
+    """Daily step totals and goals. Personal API only."""
+    blocked = _personal_only_error()
+    if blocked:
+        return blocked
+    client = _client()
+    dates = date_range_iso(max(1, min(days, MAX_DAYS_HEALTH)))
+    errors: ErrorList = []
+    raw = _endpoint(
+        f"steps:{dates[-1]}:{dates[0]}",
+        "steps",
+        lambda: client.get_steps(dates[-1], dates[0]),
+        {},
+        errors,
+    )
+    daily = []
+    for item in _rows(raw, "steps", "dailySteps", "stepsValues"):
+        day = str(item.get("calendarDate") or item.get("date") or "")[:10]
+        if not day:
+            continue
+        total = item.get("totalSteps") or item.get("steps") or item.get("value")
+        daily.append(
+            {
+                "date": day,
+                "steps": int(total) if isinstance(total, (int, float)) else None,
+                "goal": int(item["stepGoal"])
+                if isinstance(item.get("stepGoal"), (int, float))
+                else None,
+            }
+        )
+    daily.sort(key=lambda entry: entry["date"], reverse=True)
+    totals = [entry["steps"] for entry in daily if isinstance(entry["steps"], (int, float))]
+    return {
+        "period_days": len(dates),
+        "days_with_data": len(daily),
+        "avg_steps": round_number(sum(totals) / len(totals), 0) if totals else None,
+        "daily": daily,
+        **_errors_payload(errors),
+    }
+
+
+def download_activity_file(
+    activity_id: int,
+    save_path: Annotated[
+        str, Field(description="Where to write the .zip. Empty = activity-<id>.zip in cwd.")
+    ] = "",
+) -> dict[str, Any]:
+    """Download the original activity file (ZIP containing the .FIT) for one activity.
+
+    Personal API only. This is the raw recording — GPS track, HR, cadence, laps,
+    sample by sample — which the unofficial flow cannot fetch. Garmin strips some
+    fields it computes (VO2 Max, recovery time, performance condition) from files
+    delivered through its API, so this is not identical to a manual download.
+    """
+    blocked = _personal_only_error()
+    if blocked:
+        return blocked
+    client = _client()
+    manager = get_manager()
+    errors: ErrorList = []
+    target = os.path.expanduser(save_path) if save_path else f"activity-{activity_id}.zip"
+    payload = manager.safe_call(
+        lambda: client.download_activity_file(activity_id),
+        default=None,
+        errors=errors,
+        label=f"download:{activity_id}",
+    )
+    if not isinstance(payload, (bytes, bytearray)) or not payload:
+        return {
+            "activity_id": activity_id,
+            "error": "activity file not available",
+            **_errors_payload(errors),
+        }
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(target)) or ".", exist_ok=True)
+        with open(target, "wb") as handle:
+            handle.write(payload)
+    except OSError as exc:
+        return {
+            "activity_id": activity_id,
+            "error": f"could not write {target}: {exc}",
+            "bytes": len(payload),
+            **_errors_payload(errors),
+        }
+    return {
+        "activity_id": activity_id,
+        "saved_to": os.path.abspath(target),
+        "bytes": len(payload),
+        "format": "zip (contains the original .FIT)",
         **_errors_payload(errors),
     }
 
@@ -584,169 +1988,6 @@ def _mean(values: list[Any], ndigits: int = 1) -> float | None:
     return round_number(sum(numbers) / len(numbers), ndigits) if numbers else None
 
 
-def get_sleep(
-    days: Annotated[int, Field(ge=1, le=30, description="Lookback window in days.")] = 7,
-) -> dict[str, Any]:
-    """Sleep for the last N days: duration, score, stages, naps, overnight HRV/SpO2/
-    respiration/stress, bedtime and wake time, and Garmin's sleep need."""
-    dates = date_range_iso(days)
-    errors: ErrorList = []
-    raws = _fetch_days(dates, lambda d: _sleep_day(d, errors))
-    daily = [_normalize_sleep_day(day, raw) for day, raw in zip(dates, raws, strict=True)]
-
-    all_naps = [nap for d in daily for nap in d["naps"]]
-    latest_dto = (raws[0].get("dailySleepDTO") or {}) if raws else {}
-    return {
-        "period_days": len(dates),
-        "avg_hours": _mean([d["hours"] for d in daily], 2),
-        "avg_score": _mean([d["score"] for d in daily]),
-        "avg_deep_minutes": _mean([d["stages"]["deep"]["minutes"] for d in daily], 0),
-        "avg_rem_minutes": _mean([d["stages"]["rem"]["minutes"] for d in daily], 0),
-        "avg_overnight_hrv_ms": _mean([d["overnight_hrv_ms"] for d in daily]),
-        "avg_spo2": _mean([d["spo2"]["avg"] for d in daily]),
-        "avg_respiration": _mean([d["respiration"]["avg"] for d in daily]),
-        "nap_count": len(all_naps),
-        "total_nap_minutes": sum(d["nap_minutes"] or 0 for d in daily),
-        "next_sleep_need": _sleep_need(latest_dto.get("nextSleepNeed")),
-        "daily": daily,
-        **_errors_payload(errors),
-    }
-
-
-def get_resting_heart_rate(
-    days: Annotated[int, Field(ge=1, le=30, description="Lookback window in days.")] = 30,
-) -> dict[str, Any]:
-    """Daily resting heart rate with 7-day and 30-day trend summaries, up to 30 days."""
-    safe_days = max(1, min(days, 30))
-    dates = date_range_iso(safe_days)
-    errors: ErrorList = []
-    daily = []
-    for day, raw in zip(dates, _fetch_days(dates, lambda d: _rhr_day(d, errors)), strict=True):
-        daily.append({"date": day, "bpm": _extract_resting_heart_rate_bpm(raw)})
-
-    values = [item["bpm"] for item in daily if isinstance(item.get("bpm"), int)]
-    week_values = [item["bpm"] for item in daily[:7] if isinstance(item.get("bpm"), int)]
-    month_values = [item["bpm"] for item in daily[:30] if isinstance(item.get("bpm"), int)]
-    latest = next((item for item in daily if isinstance(item.get("bpm"), int)), None)
-    latest_bpm = latest["bpm"] if latest else None
-    weekly_avg = _avg(week_values)
-    monthly_avg = _avg(month_values)
-
-    return {
-        "period_days": safe_days,
-        "latest": latest,
-        "latest_bpm": latest_bpm,
-        "weekly_avg_bpm": weekly_avg,
-        "monthly_avg_bpm": monthly_avg,
-        "min_bpm": min(values) if values else None,
-        "max_bpm": max(values) if values else None,
-        "delta_latest_vs_weekly_avg_bpm": round_number(latest_bpm - weekly_avg, 1)
-        if isinstance(latest_bpm, int) and isinstance(weekly_avg, (int, float))
-        else None,
-        "delta_latest_vs_monthly_avg_bpm": round_number(latest_bpm - monthly_avg, 1)
-        if isinstance(latest_bpm, int) and isinstance(monthly_avg, (int, float))
-        else None,
-        "daily": daily,
-        **_errors_payload(errors),
-    }
-
-
-def get_stress(
-    days: Annotated[int, Field(ge=1, le=30, description="Lookback window in days.")] = 7,
-) -> dict[str, Any]:
-    """Daily all-day stress levels and stress duration buckets."""
-    dates = date_range_iso(days)
-    errors: ErrorList = []
-    daily = []
-    for day, raw in zip(dates, _fetch_days(dates, lambda d: _stress_day(d, errors)), strict=True):
-        daily.append(
-            {
-                "date": day,
-                "stress_avg": raw.get("avgStressLevel") or raw.get("overallStressLevel"),
-                "max_stress": raw.get("maxStressLevel"),
-                "rest_minutes": round_number((raw.get("restStressDuration") or 0) / 60, 1),
-                "low_minutes": round_number((raw.get("lowStressDuration") or 0) / 60, 1),
-                "medium_minutes": round_number(
-                    (raw.get("mediumStressDuration") or 0) / 60, 1
-                ),
-                "high_minutes": round_number((raw.get("highStressDuration") or 0) / 60, 1),
-                "activity_minutes": round_number(
-                    (raw.get("activityStressDuration") or 0) / 60, 1
-                ),
-            }
-        )
-    valid = [d["stress_avg"] for d in daily if isinstance(d.get("stress_avg"), (int, float))]
-    return {
-        "period_days": len(dates),
-        "period_avg_stress": round_number(sum(valid) / len(valid), 1) if valid else None,
-        "daily": daily,
-        **_errors_payload(errors),
-    }
-
-
-def _fetch_recent_activities(days: int, errors: ErrorList | None = None) -> list[dict[str, Any]]:
-    cutoff = date_range_iso(days)[-1]
-    activities = []
-    for item in _activities_raw(200, errors):
-        started = item.get("startTimeLocal") or ""
-        if started[:10] < cutoff:
-            continue
-        normalized = normalize_activity(item)
-        if normalized:
-            activities.append(normalized)
-    activities.sort(key=lambda item: item.get("date") or "", reverse=True)
-    return activities
-
-
-def _recent_activity_dates(days: int = 120, errors: ErrorList | None = None) -> list[str]:
-    dates: list[str] = []
-    cutoff = date_range_iso(days)[-1]
-    for item in _activities_raw(200, errors):
-        started = item.get("startTimeLocal") or ""
-        day = started[:10]
-        if not day or day < cutoff or day in dates:
-            continue
-        dates.append(day)
-    return dates
-
-
-def _latest_max_metrics(
-    errors: ErrorList | None = None,
-) -> tuple[str | None, dict[str, Any] | None]:
-    candidate_dates = [today_iso(), *_recent_activity_dates(errors=errors)]
-    seen: set[str] = set()
-    for day in candidate_dates:
-        if day in seen:
-            continue
-        seen.add(day)
-        raw = _max_metrics(day, errors)
-        item = raw[0] if isinstance(raw, list) and raw else raw
-        if isinstance(item, dict) and item:
-            return day, item
-    return None, None
-
-
-def get_recent_activities(
-    days: Annotated[
-        int, Field(ge=1, le=365, description="How many days back to include.")
-    ] = 14,
-    limit: Annotated[
-        int, Field(ge=1, le=200, description="Maximum number of activities to return.")
-    ] = 50,
-) -> dict[str, Any]:
-    """Recent Garmin activities with normalized sport-aware summary fields."""
-    safe_limit = max(1, min(limit, 200))
-    safe_days = max(1, min(days, 365))
-    errors: ErrorList = []
-    activities = _fetch_recent_activities(safe_days, errors)
-    return {
-        "period_days": safe_days,
-        "count": min(len(activities), safe_limit),
-        "activities": activities[:safe_limit],
-        **_errors_payload(errors),
-    }
-
-
 _GPS_KEY_RE = re.compile(r"(latitude|longitude|polyline)", re.IGNORECASE)
 
 
@@ -807,196 +2048,6 @@ def _activity_time_in_zones(
         }
         for z in sorted(zones, key=lambda z: z.get("zoneNumber") or 0)
     ]
-
-
-def get_activity_detail(activity_id: int) -> dict[str, Any]:
-    """Detailed summary for one activity by Garmin activity ID, with weather and time in
-    heart-rate and power zones."""
-    client = _client()
-    manager = get_manager()
-    errors: ErrorList = []
-    raw = manager.cached(
-        f"activity_detail:{activity_id}",
-        lambda: manager.safe_call(
-            lambda: client.get_activity(activity_id),
-            default={},
-            errors=errors,
-            label=f"activity:{activity_id}",
-        ),
-    )
-    if not isinstance(raw, dict) or not raw:
-        return {
-            "activity_id": activity_id,
-            "error": "activity not found or inaccessible",
-            **_errors_payload(errors),
-        }
-    summary = raw.get("summaryDTO") or raw.get("summary") or raw
-    type_key = activity_type_key(raw)
-    return {
-        "activity_id": activity_id,
-        "name": raw.get("activityName") or summary.get("activityName"),
-        "sport": sport_bucket(type_key),
-        "type_key": type_key,
-        "summary": _without_gps(normalize_activity(summary) or summary),
-        "training_effect": {
-            "aerobic": summary.get("trainingEffect") or summary.get("aerobicTrainingEffect"),
-            "anaerobic": summary.get("anaerobicTrainingEffect"),
-            "label": summary.get("trainingEffectLabel"),
-            "aerobic_message": summary.get("aerobicTrainingEffectMessage"),
-            "anaerobic_message": summary.get("anaerobicTrainingEffectMessage"),
-        },
-        "weather": _activity_weather(activity_id, errors),
-        "hr_time_in_zones": _activity_time_in_zones(
-            activity_id, "hr", lambda: client.get_activity_hr_in_timezones(activity_id), errors
-        ),
-        "power_time_in_zones": _activity_time_in_zones(
-            activity_id,
-            "power",
-            lambda: client.get_activity_power_in_timezones(activity_id),
-            errors,
-        ),
-        "raw_keys": sorted(raw.keys())[:80],
-        **_errors_payload(errors),
-    }
-
-
-def _number(value: Any) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return float(value)
-
-
-def _normalize_lap(lap: dict[str, Any], index: int) -> dict[str, Any]:
-    """Normalize one Garmin lap/split entry. Missing values stay null, never 0."""
-    distance_m = _number(lap.get("distance"))
-    duration_s = _number(lap.get("duration"))
-    if duration_s is None:
-        duration_s = _number(lap.get("movingDuration"))
-    speed = _number(lap.get("averageSpeed"))
-    if speed is None:
-        speed = _number(lap.get("averageMovingSpeed"))
-    pace_seconds = 1000.0 / speed if speed and speed > 0 else None
-    if pace_seconds is None and distance_m and duration_s and distance_m > 0:
-        pace_seconds = duration_s / (distance_m / 1000)
-    hr_avg = _number(lap.get("averageHR"))
-    hr_max = _number(lap.get("maxHR"))
-    cadence = _number(
-        lap.get("averageRunCadence")
-        or lap.get("averageRunningCadenceInStepsPerMinute")
-        or lap.get("averageBikingCadenceInRevPerMinute")
-    )
-    return {
-        "index": index,
-        "distance_km": round_number(distance_m / 1000, 2) if distance_m is not None else None,
-        "duration": format_duration(duration_s),
-        "duration_seconds": int(duration_s) if duration_s is not None else None,
-        "pace": _format_pace(pace_seconds),
-        "pace_seconds_per_km": round_number(pace_seconds, 1),
-        "hr_avg": int(hr_avg) if hr_avg is not None else None,
-        "hr_max": int(hr_max) if hr_max is not None else None,
-        "cadence": round_number(cadence, 0),
-        "elevation_gain_m": round_number(_number(lap.get("elevationGain")), 1),
-    }
-
-
-def _hr_drift(laps: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, str | None]:
-    """Compare first-half to second-half average HR. Returns (drift, unavailable_reason)."""
-    if len(laps) < 4:
-        return None, f"needs at least 4 laps, got {len(laps)}"
-    hr_values = [lap.get("hr_avg") for lap in laps]
-    if any(not isinstance(value, (int, float)) for value in hr_values):
-        return None, "not every lap reports an average heart rate"
-    middle = len(laps) // 2
-    first_avg = sum(hr_values[:middle]) / middle
-    second_avg = sum(hr_values[middle:]) / (len(laps) - middle)
-    if first_avg <= 0:
-        return None, "first-half average heart rate is not usable"
-    drift_pct = (second_avg - first_avg) / first_avg * 100
-    if drift_pct <= 3:
-        interpretation = "stabil"
-    elif drift_pct <= 5:
-        interpretation = "drift ringan"
-    else:
-        interpretation = "drift tinggi (cari penyebab: panas/dehidrasi/kelelahan)"
-    return {
-        "first_half_avg_hr": round_number(first_avg, 0),
-        "second_half_avg_hr": round_number(second_avg, 0),
-        "drift_pct": round(drift_pct, 1),
-        "interpretation": interpretation,
-    }, None
-
-
-def get_activity_splits(activity_id: int) -> dict[str, Any]:
-    """Per-lap splits for one activity: pace, HR, cadence, elevation and HR drift."""
-    client = _client()
-    manager = get_manager()
-    errors: ErrorList = []
-    raw = manager.cached(
-        f"activity_splits:{activity_id}",
-        lambda: manager.safe_call(
-            lambda: client.get_activity_splits(activity_id),
-            default={},
-            errors=errors,
-            label=f"splits:{activity_id}",
-        ),
-    )
-    lap_dtos = raw.get("lapDTOs") if isinstance(raw, dict) else None
-    if not isinstance(lap_dtos, list):
-        return {
-            "activity_id": activity_id,
-            "error": "splits not found or inaccessible",
-            **_errors_payload(errors),
-        }
-    laps = [
-        _normalize_lap(lap, index)
-        for index, lap in enumerate(lap_dtos, start=1)
-        if isinstance(lap, dict)
-    ]
-    if not laps:
-        return {
-            "activity_id": activity_id,
-            "error": "splits not found or inaccessible",
-            **_errors_payload(errors),
-        }
-
-    distances = [lap["distance_km"] for lap in laps]
-    durations = [lap["duration_seconds"] for lap in laps]
-    total_distance_km = (
-        round_number(sum(distances), 2) if all(value is not None for value in distances) else None
-    )
-    total_seconds = sum(durations) if all(value is not None for value in durations) else None
-    hr_pairs = [
-        (lap["hr_avg"], lap["duration_seconds"]) for lap in laps if lap["hr_avg"] is not None
-    ]
-    if not hr_pairs:
-        avg_hr = None
-    elif all(seconds for _, seconds in hr_pairs):
-        weight = sum(seconds for _, seconds in hr_pairs)
-        avg_hr = round_number(sum(hr * seconds for hr, seconds in hr_pairs) / weight, 0)
-    else:
-        avg_hr = round_number(sum(hr for hr, _ in hr_pairs) / len(hr_pairs), 0)
-    cadences = [lap["cadence"] for lap in laps if lap["cadence"] is not None]
-    elevations = [lap["elevation_gain_m"] for lap in laps if lap["elevation_gain_m"] is not None]
-    hr_drift, hr_drift_note = _hr_drift(laps)
-    summary = {
-        "distance_km": total_distance_km,
-        "duration": format_duration(total_seconds),
-        "avg_pace": _format_pace(total_seconds / total_distance_km)
-        if total_seconds and total_distance_km
-        else None,
-        "avg_hr": avg_hr,
-        "avg_cadence": round_number(sum(cadences) / len(cadences), 0) if cadences else None,
-        "elevation_gain_m": round_number(sum(elevations), 1) if elevations else None,
-    }
-    return {
-        "activity_id": activity_id,
-        "lap_count": len(laps),
-        "laps": laps,
-        "summary": summary,
-        "hr_drift": hr_drift,
-        **({"hr_drift_note": hr_drift_note} if hr_drift_note else {}),
-        **_errors_payload(errors),
-    }
 
 
 def _stream_rows(raw: Any) -> list[dict[str, Any]]:
@@ -1185,426 +2236,6 @@ def get_activity_distance_splits(
         else None,
         **_errors_payload(errors),
     }
-
-
-def _run_activities(days: int, errors: ErrorList | None = None) -> list[dict[str, Any]]:
-    return [
-        activity
-        for activity in _fetch_recent_activities(days, errors)
-        if activity.get("sport") == "run"
-    ]
-
-
-def _pace_seconds_from_activity(activity: dict[str, Any]) -> float | None:
-    distance = activity.get("distance_km")
-    duration = activity.get("duration_min")
-    if not isinstance(distance, (int, float)) or not isinstance(duration, (int, float)):
-        return None
-    if distance <= 0 or duration <= 0:
-        return None
-    return (duration * 60) / distance
-
-
-def _format_pace(seconds_per_km: float | None) -> str | None:
-    if seconds_per_km is None:
-        return None
-    minutes = int(seconds_per_km // 60)
-    seconds = int(seconds_per_km % 60)
-    return f"{minutes}:{seconds:02d}/km"
-
-
-def _month_key(activity: dict[str, Any]) -> str:
-    date_value = activity.get("date") or ""
-    return str(date_value)[:7] if date_value else "unknown"
-
-
-def get_running_summary(
-    days: Annotated[
-        int, Field(ge=1, le=365, description="Lookback window in days.")
-    ] = 90,
-) -> dict[str, Any]:
-    """Running summary: sessions, distance, pace, HR, longest run, fastest run, monthly split."""
-    safe_days = max(1, min(days, 365))
-    errors: ErrorList = []
-    runs = _run_activities(safe_days, errors)
-    total_distance = sum(activity.get("distance_km") or 0 for activity in runs)
-    total_minutes = sum(activity.get("duration_min") or 0 for activity in runs)
-    hr_values = [
-        activity["hr_avg"]
-        for activity in runs
-        if isinstance(activity.get("hr_avg"), (int, float))
-    ]
-    longest = max(runs, key=lambda activity: activity.get("distance_km") or 0, default=None)
-    paced_runs = [
-        (activity, _pace_seconds_from_activity(activity))
-        for activity in runs
-        if _pace_seconds_from_activity(activity) is not None
-    ]
-    fastest = min(paced_runs, key=lambda item: item[1] or 999999, default=(None, None))[0]
-    return {
-        "period_days": safe_days,
-        "sessions": len(runs),
-        "total_distance_km": round_number(total_distance, 2),
-        "total_duration_hours": round_number(total_minutes / 60, 2),
-        "average_pace": _format_pace((total_minutes * 60) / total_distance)
-        if total_distance
-        else None,
-        "average_hr": round_number(sum(hr_values) / len(hr_values), 0) if hr_values else None,
-        "longest_run": _compact_activity(longest),
-        "fastest_run": _compact_activity(fastest),
-        "monthly": get_monthly_running_stats(months=max(1, min(12, (safe_days + 30) // 31)))[
-            "months"
-        ],
-        **_errors_payload(errors),
-    }
-
-
-def get_monthly_running_stats(
-    months: Annotated[
-        int, Field(ge=1, le=12, description="How many recent months to summarize.")
-    ] = 3,
-) -> dict[str, Any]:
-    """Monthly running stats for the last N calendar-ish months based on recent activities."""
-    safe_months = max(1, min(months, 12))
-    errors: ErrorList = []
-    runs = _run_activities(safe_months * 31, errors)
-    buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for run in runs:
-        buckets[_month_key(run)].append(run)
-    months_out = []
-    for month in sorted(buckets.keys(), reverse=True)[:safe_months]:
-        items = buckets[month]
-        distance = sum(item.get("distance_km") or 0 for item in items)
-        minutes = sum(item.get("duration_min") or 0 for item in items)
-        hr_values = [
-            item["hr_avg"] for item in items if isinstance(item.get("hr_avg"), (int, float))
-        ]
-        months_out.append(
-            {
-                "month": month,
-                "sessions": len(items),
-                "total_distance_km": round_number(distance, 2),
-                "total_duration_hours": round_number(minutes / 60, 2),
-                "average_pace": _format_pace((minutes * 60) / distance)
-                if distance
-                else None,
-                "average_hr": round_number(sum(hr_values) / len(hr_values), 0)
-                if hr_values
-                else None,
-            }
-        )
-    return {"months_requested": safe_months, "months": months_out, **_errors_payload(errors)}
-
-
-def _compact_activity(activity: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not activity:
-        return None
-    return {
-        "activity_id": activity.get("activity_id"),
-        "name": activity.get("name"),
-        "date": activity.get("date"),
-        "distance_km": activity.get("distance_km"),
-        "duration": activity.get("duration"),
-        "pace": _format_pace(_pace_seconds_from_activity(activity)),
-        "hr_avg": activity.get("hr_avg"),
-    }
-
-
-def get_recent_load(
-    days: Annotated[
-        int, Field(ge=1, le=365, description="Lookback window in days.")
-    ] = 28,
-) -> dict[str, Any]:
-    """Training volume aggregated by sport over the last N days."""
-    safe_days = max(1, min(days, 365))
-    errors: ErrorList = []
-    activities = _fetch_recent_activities(safe_days, errors)
-    buckets: dict[str, dict[str, Any]] = {}
-    for activity in activities:
-        sport = activity.get("sport") or "other"
-        bucket = buckets.setdefault(
-            sport, {"sessions": 0, "total_km": 0.0, "total_minutes": 0.0, "hr_sum": 0, "hr_n": 0}
-        )
-        bucket["sessions"] += 1
-        bucket["total_km"] += activity.get("distance_km") or 0
-        bucket["total_minutes"] += activity.get("duration_min") or 0
-        if isinstance(activity.get("hr_avg"), (int, float)):
-            bucket["hr_sum"] += activity["hr_avg"]
-            bucket["hr_n"] += 1
-    by_sport = {}
-    for sport, bucket in buckets.items():
-        by_sport[sport] = {
-            "sessions": bucket["sessions"],
-            "total_km": round_number(bucket["total_km"], 2),
-            "total_minutes": round_number(bucket["total_minutes"], 1),
-            "total_hours": round_number(bucket["total_minutes"] / 60, 2),
-            "avg_hr": round_number(bucket["hr_sum"] / bucket["hr_n"], 0)
-            if bucket["hr_n"]
-            else None,
-        }
-    return {"period_days": safe_days, "by_sport": by_sport, **_errors_payload(errors)}
-
-
-def get_training_load() -> dict[str, Any]:
-    """Garmin training load status, acute/chronic load, and load focus."""
-    today = today_iso()
-    errors: ErrorList = []
-    raw = _training_status(today, errors)
-    if not raw:
-        return {
-            "date": today,
-            "source": "garmin_training_status",
-            "available": False,
-            "reason": "training status endpoint returned no data",
-            **_errors_payload(errors),
-        }
-
-    acute = chronic = ratio = status = None
-    load_balance = raw.get("mostRecentTrainingLoadBalance")
-    if isinstance(load_balance, dict):
-        acute = round_number(
-            load_balance.get("acuteTrainingLoad")
-            or load_balance.get("dailyTrainingLoadAcute")
-            or load_balance.get("load")
-            or load_balance.get("trainingLoad"),
-            1,
-        )
-        chronic = round_number(
-            load_balance.get("chronicTrainingLoad")
-            or load_balance.get("dailyTrainingLoadChronic"),
-            1,
-        )
-        ratio = round_number(
-            load_balance.get("acuteChronicWorkloadRatio")
-            or load_balance.get("dailyAcuteChronicWorkloadRatio"),
-            2,
-        )
-        status = load_balance.get("acwrStatus") or load_balance.get("loadStatus")
-
-    latest_map = (raw.get("mostRecentTrainingStatus") or {}).get("latestTrainingStatusData") or {}
-    if latest_map:
-        first = next(iter(latest_map.values()))
-        if isinstance(first, dict):
-            atl = first.get("acuteTrainingLoadDTO") or {}
-            acute = acute or round_number(atl.get("dailyTrainingLoadAcute"), 1)
-            chronic = chronic or round_number(atl.get("dailyTrainingLoadChronic"), 1)
-            ratio = ratio or round_number(atl.get("dailyAcuteChronicWorkloadRatio"), 2)
-            status = status or atl.get("acwrStatus")
-
-    return {
-        "date": today,
-        "source": "garmin_training_status",
-        "available": any(value is not None for value in [acute, chronic, ratio, status]),
-        "acute_load": acute,
-        "chronic_load": chronic,
-        "load_ratio": ratio,
-        "acwr_status": status,
-        "raw_sections_present": {
-            "mostRecentTrainingLoadBalance": raw.get("mostRecentTrainingLoadBalance") is not None,
-            "mostRecentTrainingStatus": raw.get("mostRecentTrainingStatus") is not None,
-        },
-        **_errors_payload(errors),
-    }
-
-
-def get_fitness() -> dict[str, Any]:
-    """VO2 max, cycling FTP, and race predictions."""
-    client = _client()
-    manager = get_manager()
-    errors: ErrorList = []
-    race_raw = manager.cached(
-        "race_predictions",
-        lambda: manager.safe_call(
-            lambda: client.get_race_predictions(),
-            default=None,
-            errors=errors,
-            label="race_predictions",
-        ),
-    )
-    ftp_raw = manager.cached(
-        "cycling_ftp",
-        lambda: manager.safe_call(
-            lambda: client.get_cycling_ftp(),
-            default=None,
-            errors=errors,
-            label="cycling_ftp",
-        ),
-    )
-
-    vo2_run = vo2_bike = None
-    metrics_date, item = _latest_max_metrics(errors)
-    if isinstance(item, dict):
-        generic = item.get("generic") or {}
-        cycling = item.get("cycling") or {}
-        vo2_run = round_number(generic.get("vo2MaxPreciseValue") or generic.get("vo2MaxValue"), 1)
-        vo2_bike = round_number(cycling.get("vo2MaxPreciseValue") or cycling.get("vo2MaxValue"), 1)
-
-    race_item = race_raw[-1] if isinstance(race_raw, list) and race_raw else race_raw
-    race = {}
-    if isinstance(race_item, dict):
-        for key_in, key_out in [
-            ("time5K", "5k"),
-            ("time10K", "10k"),
-            ("timeHalfMarathon", "half_marathon"),
-            ("timeMarathon", "marathon"),
-        ]:
-            seconds = race_item.get(key_in)
-            if isinstance(seconds, (int, float)) and seconds > 0:
-                race[key_out] = {"seconds": int(seconds)}
-
-    return {
-        "metrics_date": metrics_date,
-        "vo2_max_running": vo2_run,
-        "vo2_max_cycling": vo2_bike,
-        "cycling_ftp_w": ftp_raw.get("functionalThresholdPower")
-        if isinstance(ftp_raw, dict)
-        else ftp_raw,
-        "race_predictions": race or None,
-        **_errors_payload(errors),
-    }
-
-
-def get_zones() -> dict[str, Any]:
-    """Heart-rate zones (bpm ranges per sport, with max/resting/threshold HR used),
-    running power zones, and thresholds from Garmin user settings."""
-    client = _client()
-    errors: ErrorList = []
-    raw = _endpoint(
-        "user_profile",
-        "user_profile",
-        lambda: client.get_user_profile(),
-        {},
-        errors,
-    )
-    user_data = raw.get("userData") if isinstance(raw, dict) else None
-    zones: dict[str, Any] = {}
-    if isinstance(user_data, dict):
-        for key, value in user_data.items():
-            if not isinstance(key, str) or value in (None, [], {}):
-                continue
-            if _ZONE_KEY_RE.search(key):
-                zones[key] = value
-    hr_raw = _endpoint("heart_rate_zones", "heart_rate_zones",
-                       lambda: client.get_heart_rate_zones(), [], errors)
-    power_raw = _endpoint("power_zones:RUNNING", "power_zones:running",
-                          lambda: client.get_power_zones_for_sport("RUNNING"), {}, errors)
-    hr_zones = _hr_zone_sets(hr_raw)
-    power_zones = _power_zone_set(power_raw)
-    available = bool(zones or hr_zones)
-    return {
-        "available": available,
-        "source": "garmin_user_settings",
-        "zones": zones or None,
-        "heart_rate_zones": hr_zones,
-        "running_power_zones": power_zones,
-        "reason": None if available
-        else "user settings did not expose zone data for this account",
-        **_errors_payload(errors),
-    }
-
-
-def get_personal_records() -> dict[str, Any]:
-    """Personal records returned by Garmin Connect."""
-    client = _client()
-    manager = get_manager()
-    errors: ErrorList = []
-    getter = getattr(client, "get_personal_record", None) or getattr(
-        client, "get_personal_records", None
-    )
-    if getter is None:
-        return {
-            "count": 0,
-            "records": [],
-            "available": False,
-            "reason": "garminconnect client does not expose a personal records endpoint",
-        }
-    raw = manager.cached(
-        "personal_records",
-        lambda: manager.safe_call(getter, default=[], errors=errors, label="personal_records"),
-    )
-    if isinstance(raw, dict):
-        raw = (
-            raw.get("personalRecords")
-            or raw.get("userPersonalRecords")
-            or raw.get("records")
-            or raw.get("prRecords")
-            or []
-        )
-    type_map = _personal_record_type_map(client, manager)
-    records = []
-    if isinstance(raw, list):
-        for record in raw:
-            if not isinstance(record, dict):
-                continue
-            type_id = _personal_record_type_id(record.get("typeId"))
-            type_info = type_map.get(type_id) if type_id is not None else None
-            label_key = (
-                _personal_record_label_key(record.get("prTypeLabelKey"))
-                or _personal_record_label_key(record.get("typeLabelKey"))
-                or _personal_record_label_key(type_info)
-            )
-            label = _personal_record_label(label_key, type_id)
-            records.append(
-                {
-                    "type_id": type_id,
-                    "name": label,
-                    "label": label,
-                    "label_key": label_key,
-                    "sport": type_info.get("sport") if isinstance(type_info, dict) else None,
-                    "value": record.get("value"),
-                    "date": record.get("prStartTimeGmtFormatted") or record.get("prStartTimeGmt"),
-                }
-            )
-    return {"count": len(records), "records": records, "available": True, **_errors_payload(errors)}
-
-
-def get_health_summary(
-    days: Annotated[
-        int, Field(ge=1, le=30, description="Lookback window in days.")
-    ] = 7,
-) -> dict[str, Any]:
-    """Compact health snapshot combining recovery, sleep, and stress."""
-    return {
-        "date": today_iso(),
-        "recovery": get_recovery(),
-        "sleep": get_sleep(days),
-        "resting_heart_rate": get_resting_heart_rate(min(max(days, 1), 30)),
-        "stress": get_stress(days),
-    }
-
-
-def get_full_snapshot(
-    activity_days: Annotated[
-        int, Field(ge=1, le=365, description="Activity window in days.")
-    ] = 14,
-    load_days: Annotated[
-        int, Field(ge=1, le=365, description="Training load window in days.")
-    ] = 28,
-) -> dict[str, Any]:
-    """Comprehensive Garmin data snapshot for holistic analysis."""
-    sections: dict[str, Callable[[], dict[str, Any]]] = {
-        "recovery": get_recovery,
-        "sleep": lambda: get_sleep(7),
-        "resting_heart_rate": lambda: get_resting_heart_rate(30),
-        "stress": lambda: get_stress(7),
-        "recent_activities": lambda: get_recent_activities(activity_days),
-        "recent_load": lambda: get_recent_load(load_days),
-        "training_load": get_training_load,
-        "fitness": get_fitness,
-        "running_summary": lambda: get_running_summary(activity_days),
-        "zones": get_zones,
-        "personal_records": get_personal_records,
-    }
-    out: dict[str, Any] = {
-        "snapshot_date": today_iso(),
-        "activity_window_days": activity_days,
-        "load_window_days": load_days,
-    }
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        futures = {name: ex.submit(_safe_section, fn) for name, fn in sections.items()}
-        for name, future in futures.items():
-            out[name] = future.result()
-    return out
 
 
 def _days_ago_iso(days: int) -> str:
@@ -2353,9 +2984,6 @@ def _hourly(
     return buckets
 
 
-# --- zones -------------------------------------------------------------------------------
-
-
 def _zone_ranges(floors: list[Any], top: Any) -> list[dict[str, Any]]:
     zones = []
     for i, low in enumerate(floors):
@@ -2396,9 +3024,6 @@ def _power_zone_set(raw: Any) -> dict[str, Any] | None:
         "threshold_power_w": raw.get("functionalThresholdPower"),
         "zones_w": _zone_ranges(floors, None),
     }
-
-
-# --- long-term trends --------------------------------------------------------------------
 
 
 def _week_buckets(daily: list[tuple[str, Any]], weeks: int) -> list[dict[str, Any]]:
@@ -2575,9 +3200,6 @@ def get_hrv_trend(
     }
 
 
-# --- activity segments -------------------------------------------------------------------
-
-
 _SEGMENT_TYPES = {"RWD_RUN": "run", "RWD_WALK": "walk", "RWD_STAND": "stand"}
 
 
@@ -2635,9 +3257,6 @@ def get_activity_segments(activity_id: int) -> dict[str, Any]:
         "segments": segments,
         **_errors_payload(errors),
     }
-
-
-# --- daily timeline ----------------------------------------------------------------------
 
 
 def get_daily_timeline(
@@ -2717,9 +3336,6 @@ def get_daily_timeline(
         "auto_detected_activities": detected,
         **_errors_payload(errors),
     }
-
-
-# --- sleep detail ------------------------------------------------------------------------
 
 
 _SLEEP_STAGES = {0: "deep", 1: "light", 2: "rem", 3: "awake"}
@@ -2840,9 +3456,6 @@ def get_sleep_detail(
     }
 
 
-# --- workouts ----------------------------------------------------------------------------
-
-
 def _pace_from_mps(value: Any) -> str | None:
     if not isinstance(value, (int, float)) or value <= 0:
         return None
@@ -2942,9 +3555,6 @@ def get_workout_detail(workout_id: int) -> dict[str, Any]:
     }
 
 
-# --- yearly totals -----------------------------------------------------------------------
-
-
 def get_yearly_totals(
     year: Annotated[int, Field(ge=0, le=2100, description="Calendar year; 0 for current.")]
     = 0,
@@ -2984,9 +3594,6 @@ def get_yearly_totals(
         )
     sports.sort(key=lambda s: s["distance_km"] or 0, reverse=True)
     return {"year": year, "through": end, "sports": sports, **_errors_payload(errors)}
-
-
-# --- badges ------------------------------------------------------------------------------
 
 
 def get_badges(
@@ -3038,40 +3645,45 @@ def get_badges(
     }
 
 
-def _safe_section(fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
-    try:
-        return fn()
-    except Exception as exc:
-        return {"error": f"{type(exc).__name__}: {exc}"}
-
-
 TOOL_SPECS = [
     ToolSpec("get_recovery", get_recovery.__doc__ or "", get_recovery, {}),
     ToolSpec(
         "get_sleep",
         get_sleep.__doc__ or "",
         get_sleep,
-        {"days": {"type": "integer", "default": 7, "minimum": 1, "maximum": 30}},
+        {"days": {"type": "integer", "default": 7, "minimum": 1, "maximum": MAX_DAYS_HEALTH}},
     ),
     ToolSpec(
         "get_resting_heart_rate",
         get_resting_heart_rate.__doc__ or "",
         get_resting_heart_rate,
-        {"days": {"type": "integer", "default": 30, "minimum": 1, "maximum": 30}},
+        {"days": {"type": "integer", "default": 30, "minimum": 1, "maximum": MAX_DAYS_HEALTH}},
     ),
     ToolSpec(
         "get_stress",
         get_stress.__doc__ or "",
         get_stress,
-        {"days": {"type": "integer", "default": 7, "minimum": 1, "maximum": 30}},
+        {"days": {"type": "integer", "default": 7, "minimum": 1, "maximum": MAX_DAYS_HEALTH}},
     ),
     ToolSpec(
         "get_recent_activities",
         get_recent_activities.__doc__ or "",
         get_recent_activities,
         {
-            "days": {"type": "integer", "default": 14, "minimum": 1, "maximum": 365},
-            "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+            "days": {
+                "type": "integer",
+                "default": 14,
+                "minimum": 1,
+                "maximum": MAX_DAYS_ACTIVITIES,
+            },
+            "limit": {
+                "type": "integer",
+                "default": 50,
+                "minimum": 1,
+                "maximum": MAX_ACTIVITY_LIMIT,
+            },
+            "start_date": {"type": "string", "default": ""},
+            "end_date": {"type": "string", "default": ""},
         },
     ),
     ToolSpec(
@@ -3087,19 +3699,10 @@ TOOL_SPECS = [
         {"activity_id": {"type": "integer"}},
     ),
     ToolSpec(
-        "get_activity_distance_splits",
-        get_activity_distance_splits.__doc__ or "",
-        get_activity_distance_splits,
-        {
-            "activity_id": {"type": "integer"},
-            "split_km": {"type": "number", "default": 1.0, "minimum": 0.2, "maximum": 10},
-        },
-    ),
-    ToolSpec(
         "get_recent_load",
         get_recent_load.__doc__ or "",
         get_recent_load,
-        {"days": {"type": "integer", "default": 28, "minimum": 1, "maximum": 365}},
+        {"days": {"type": "integer", "default": 28, "minimum": 1, "maximum": MAX_DAYS_ACTIVITIES}},
     ),
     ToolSpec("get_training_load", get_training_load.__doc__ or "", get_training_load, {}),
     ToolSpec("get_fitness", get_fitness.__doc__ or "", get_fitness, {}),
@@ -3109,7 +3712,7 @@ TOOL_SPECS = [
         "get_running_summary",
         get_running_summary.__doc__ or "",
         get_running_summary,
-        {"days": {"type": "integer", "default": 90, "minimum": 1, "maximum": 365}},
+        {"days": {"type": "integer", "default": 90, "minimum": 1, "maximum": MAX_DAYS_ACTIVITIES}},
     ),
     ToolSpec(
         "get_monthly_running_stats",
@@ -3121,15 +3724,80 @@ TOOL_SPECS = [
         "get_health_summary",
         get_health_summary.__doc__ or "",
         get_health_summary,
-        {"days": {"type": "integer", "default": 7, "minimum": 1, "maximum": 30}},
+        {"days": {"type": "integer", "default": 7, "minimum": 1, "maximum": MAX_DAYS_HEALTH}},
+    ),
+    ToolSpec(
+        "get_hrv_history",
+        get_hrv_history.__doc__ or "",
+        get_hrv_history,
+        {"days": {"type": "integer", "default": 30, "minimum": 1, "maximum": MAX_DAYS_HEALTH}},
+    ),
+    ToolSpec(
+        "get_body_battery_range",
+        get_body_battery_range.__doc__ or "",
+        get_body_battery_range,
+        {"days": {"type": "integer", "default": 7, "minimum": 1, "maximum": MAX_DAYS_HEALTH}},
+    ),
+    ToolSpec(
+        "get_body_composition",
+        get_body_composition.__doc__ or "",
+        get_body_composition,
+        {"days": {"type": "integer", "default": 30, "minimum": 1, "maximum": MAX_DAYS_HEALTH}},
+    ),
+    ToolSpec(
+        "get_spo2",
+        get_spo2.__doc__ or "",
+        get_spo2,
+        {"days": {"type": "integer", "default": 7, "minimum": 1, "maximum": MAX_DAYS_HEALTH}},
+    ),
+    ToolSpec(
+        "get_hydration",
+        get_hydration.__doc__ or "",
+        get_hydration,
+        {"days": {"type": "integer", "default": 7, "minimum": 1, "maximum": MAX_DAYS_HEALTH}},
+    ),
+    ToolSpec(
+        "get_steps_history",
+        get_steps_history.__doc__ or "",
+        get_steps_history,
+        {"days": {"type": "integer", "default": 7, "minimum": 1, "maximum": MAX_DAYS_HEALTH}},
+    ),
+    ToolSpec("get_fitness_age", get_fitness_age.__doc__ or "", get_fitness_age, {}),
+    ToolSpec(
+        "download_activity_file",
+        download_activity_file.__doc__ or "",
+        download_activity_file,
+        {
+            "activity_id": {"type": "integer"},
+            "save_path": {"type": "string", "default": ""},
+        },
     ),
     ToolSpec(
         "get_full_snapshot",
         get_full_snapshot.__doc__ or "",
         get_full_snapshot,
         {
-            "activity_days": {"type": "integer", "default": 14, "minimum": 1, "maximum": 365},
-            "load_days": {"type": "integer", "default": 28, "minimum": 1, "maximum": 365},
+            "activity_days": {
+                "type": "integer",
+                "default": 14,
+                "minimum": 1,
+                "maximum": MAX_DAYS_ACTIVITIES,
+            },
+            "load_days": {
+                "type": "integer",
+                "default": 28,
+                "minimum": 1,
+                "maximum": MAX_DAYS_ACTIVITIES,
+            },
+        },
+    ),
+    ToolSpec(
+        "get_activity_distance_splits",
+        get_activity_distance_splits.__doc__ or "",
+        get_activity_distance_splits,
+        {
+            "activity_id": {"type": "integer"},
+            "split_km": {"type": "number", "default": 1.0, "minimum": 0.2, "maximum": 10},
         },
     ),
     ToolSpec(
@@ -3237,6 +3905,15 @@ TOOL_SPECS = [
         {"recent": {"type": "integer", "default": 15, "minimum": 1, "maximum": 100}},
     ),
 ]
+
+# Imported last: extended_tools builds on the helpers defined above.
+from .extended_tools import EXTENDED_TOOL_SPECS  # noqa: E402
+
+TOOL_SPECS.extend(EXTENDED_TOOL_SPECS)
+
+from .coach import COACH_TOOL_SPECS  # noqa: E402
+
+TOOL_SPECS.extend(COACH_TOOL_SPECS)
 
 TOOLS_BY_NAME = {spec.name: spec for spec in TOOL_SPECS}
 

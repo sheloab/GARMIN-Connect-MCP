@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__garmin__get_recovery",
+      "mcp__garmin__get_sleep",
+      "mcp__garmin__get_resting_heart_rate",
+      "mcp__garmin__get_stress",
+      "mcp__garmin__get_recent_activities",
+      "mcp__garmin__get_activity_detail",
+      "mcp__garmin__get_recent_load",
+      "mcp__garmin__get_training_load",
+      "mcp__garmin__get_fitness",
+      "mcp__garmin__get_zones",
+      "mcp__garmin__get_personal_records",
+      "mcp__garmin__get_running_summary",
+      "mcp__garmin__get_monthly_running_stats",
+      "mcp__garmin__get_health_summary",
+      "mcp__garmin__get_full_snapshot"
+    ]
+  }
+}

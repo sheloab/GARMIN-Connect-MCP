@@ -57,9 +57,27 @@ Most fitness advice from LLMs is generic. This server lets an LLM inspect your r
 
 The core server is provider-neutral. DeepSeek, OpenAI, OpenRouter, and Gemini integrations are optional demo bridges for clients that do not speak MCP directly.
 
+## Two Garmin Backends
+
+| | **personal** (official) | **unofficial** (email/password) |
+|---|---|---|
+| Auth | Self-serve API key → 24 h bearer token | Garmin SSO + cached tokens |
+| Stability | Documented, rate-limit friendly | Breaks when SSO/Cloudflare changes |
+| Raw `.FIT` download | ✅ | ❌ |
+| Sleep/HRV/stress/body battery/RHR/weight/SpO2/steps | ✅ | ✅ |
+| Training status/load, readiness, VO2 Max, race predictions, personal records | ❌ | ✅ |
+
+`GARMIN_AUTH_MODE` picks the strategy:
+
+- `auto` (default) — official Personal API when `GARMIN_PERSONAL_API_KEY` is set, else email/password.
+- `personal` / `unofficial` — force one backend.
+- `hybrid` — run **both**: wellness and raw-file reads go to the official API, Garmin-derived metrics go to email/password, with automatic fallback when a call fails. This is the only mode that returns derived metrics *and* raw `.FIT` files from one process. It needs both credential sets. Tools that need a metric the active backend cannot see return that field as `null` with an `errors` entry explaining why, instead of failing the whole call. Setup and endpoint mapping: [docs/personal-api.md](docs/personal-api.md).
+
 ## Features
 
-- **36 Garmin tools and 4 prompt templates** for training, recovery and sleep analysis.
+- **59 Garmin tools and 6 prompt templates** for training, recovery and sleep analysis.
+- **Two Garmin backends, switchable or combined**: the official [Connect Personal API](docs/personal-api.md) (self-serve key, stable) and the unofficial email/password flow. `GARMIN_AUTH_MODE=hybrid` routes each read to the backend that owns it.
+- **Raw activity files**: `download_activity_file` fetches the original `.FIT` (ZIP) through the Personal API.
 - **Demo mode** — `serve --demo` runs on fictional sample data with no credentials, for try-outs and recordings.
 - **Local MCP server** over `stdio` or Streamable HTTP (`/mcp`).
 - **Endpoint-level TTL cache with single-flight factories** — concurrent tool calls share one Garmin request instead of stampeding the API.
@@ -125,17 +143,32 @@ Copy the example settings file and fill in your Garmin Connect email and passwor
 cp .env.example .env              # Windows PowerShell: Copy-Item .env.example .env
 ```
 
+Pick a backend in `.env`:
+
 ```env
+# Official Personal API (recommended): create a key at
+# https://connect.garmin.com/app/settings/personalApiToken
+GARMIN_AUTH_MODE=personal
+GARMIN_PERSONAL_API_KEY=your-key-here
+```
+
+or the unofficial email/password flow:
+
+```env
+GARMIN_AUTH_MODE=unofficial
 GARMIN_EMAIL=you@example.com
 GARMIN_PASSWORD=your-password
 ```
 
-`.env` is listed in `.gitignore`, so it is never committed. Leave the provider keys empty unless you plan to use the [provider demo agents](#provider-demo-agents).
-
 ### 5. Log in once
 
+The unofficial flow needs a one-time interactive login (MFA supported); the
+Personal API needs no login step:
+
 ```bash
-uv run garmin-mcp login
+uv run garmin-mcp login                  # unofficial backend only
+uv run garmin-mcp personal-api --check   # official backend: token + sample per endpoint
+uv run garmin-mcp doctor --live
 ```
 
 Run this in a normal terminal: if your account uses two-factor authentication, Garmin sends a code and the command asks you to type it. The login tokens are saved in `~/.garminconnect` (change with `GARMIN_TOKEN_STORE`), so later starts do not need to log in again.
@@ -287,7 +320,57 @@ Per-client examples (Cursor, Continue, Hermes, generic stdio/HTTP) live in [docs
 | `get_devices` | **New.** Registered Garmin devices, firmware version, last upload, and alarms |
 | `get_badges` | **New.** Earned badges and points, badges in progress, and joined challenges |
 | `get_body_metrics` | **New.** Weigh-ins and body composition, blood pressure readings, and today's hydration |
-| `get_full_snapshot` | Broad multi-section Garmin snapshot |
+| `get_hrv_history` | Daily HRV (last-night + weekly average) with a baseline over a longer window |
+| `get_body_battery_range` | Daily body battery: charged, drained, highest, lowest, end of day |
+| `get_body_composition` | Weight, BMI, body fat/muscle/water from Garmin weight entries — **Personal API only** |
+| `get_spo2` | Daily blood oxygen (SpO2) — **Personal API only** |
+| `get_hydration` | Logged daily fluid intake in millilitres — **Personal API only** |
+| `get_steps_history` | Daily steps versus goal — **Personal API only** |
+| `get_fitness_age` | Garmin fitness age versus chronological age — **Personal API only** |
+| `download_activity_file` | Original activity file (ZIP with the `.FIT`) written to disk — **Personal API only** |
+| `get_full_snapshot` | Broad multi-section Garmin snapshot; each section carries `data_source` (and `source_detail` when a section needed both backends) |
+
+### Health, ECG and coaching
+
+Read through the email/password backend (garminconnect 0.3.20+); GPS is stripped and long series are capped.
+
+| Tool | Purpose |
+|---|---|
+| `get_health_snapshots` | Health Snapshot sessions (2-minute recording): HR, HRV, respiration, stress, SpO2; optional per-epoch samples |
+| `get_ecg_readings` | ECG app recordings: rhythm classification, average HR, symptoms; one recording in detail, waveform on request (not a diagnosis) |
+| `get_blood_pressure` | Last reading per day and 52 weekly averages |
+| `get_cardio_respiratory` | Daily resting/min/max HR, respiration, SpO2 acclimation, weekly HR incl. abnormal-HR alerts |
+| `get_sleep_stats` | Overall and weekly sleep statistics, today's naps |
+| `get_glucose` | Logged glucose readings (manual or CGM) |
+| `get_wellness_trends` | Weekly calories, floors, hydration, fitness age; daily stress, body battery, intensity minutes; monthly steps; lifetime totals |
+| `get_advanced_performance` | Running economy, stamina curve, running power curve and FTP, heat/altitude acclimation, 4-week load balance, weekly training status, readiness history, biometrics, fitness-age targets, cycling ability, swim CSS |
+| `get_training_plan_context` | Primary race, upcoming events, active training plans, scheduled workouts, PacePro bands, fastest splits, PR candidates |
+| `get_activity_extras` | One activity's laps, workout-step results, strength sets, power curve, gear, badges and PRs |
+| `get_athlete_profile` | Personal information, HR zones (v2), power zones, units, timezone, devices, sensors, last sync |
+| `list_garmin_methods` | Every read-only Garmin method `garmin_read` can call, with parameters |
+| `garmin_read` | Call any `get_*` Garmin method by name (read-only; auth-header and edit/delete/upload methods are blocked) |
+
+Prompts `health_review` and `running_coach_program` chain these tools into a full health review and a periodized, coach-style running plan.
+
+### Coaching and air quality
+
+| Tool | Purpose |
+|---|---|
+| `build_running_plan` | Evidence-based plan for 10K, half or marathon. `weeks=0` recommends a length (2, 4, 8, 12 or 16 weeks) from your last 12 weeks of running; then it builds week-by-week volume, long run, sessions with VDOT paces and your HR zones, strength work, adjustment rules and cited studies |
+| `get_running_air_quality` | Finds your usual running areas from activity start points (rounded to `AIR_QUALITY_GRID_DEG`, default 0.01 deg ~ 1 km; exact GPS never leaves), then reports PM2.5, PM10, ozone, NO2 and US AQI during your runs, the cleanest hours per area and a forecast of the best run windows (Open-Meteo / CAMS) |
+
+Evidence built into the plan rules: Frandsen et al. 2025 (single-session spikes, Br J Sports Med), Buist et al. 2008 (10% rule RCT), Nielsen et al. 2014 (weekly progression, JOSPT), Seiler & Kjerland 2006 and Stoggl & Sperlich 2014 (intensity distribution), Bosquet et al. 2007 (taper meta-analysis), Blagrove et al. 2018 (strength training), Kiviniemi et al. 2007 (HRV-guided training), Giles & Koehle 2014 and WHO 2021 (air pollution), Roberts et al. 2023 (ACSM heat illness), Daniels (VDOT paces). Every plan returns the list with what each rule changed.
+
+## Activity windows
+
+`get_recent_activities` accepts either a lookback (`days`) or an explicit window:
+
+```jsonc
+{ "days": 30 }                                          // newest 30 days
+{ "start_date": "2026-08-01", "end_date": "2026-08-31" } // August 2026 only
+```
+
+Both dates are inclusive and `YYYY-MM-DD`; `end_date` defaults to today. Explicit dates win over `days` and make a **past** window queryable without pulling every newer activity first — the pager walks backwards and stops once it reaches `start_date`. The response then includes the resolved `window` so callers can see exactly what was queried. Invalid or reversed dates return an `error` field instead of silently returning everything.
 
 ## MCP Prompts
 
@@ -302,14 +385,59 @@ All settings come from environment variables (`.env` is loaded automatically).
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GARMIN_EMAIL` | — | Garmin Connect account email (required) |
-| `GARMIN_PASSWORD` | — | Garmin Connect password (required) |
+| `GARMIN_AUTH_MODE` | `auto` | `auto`, `personal` (official API), `unofficial` (email/password) or `hybrid` (both, routed per endpoint) |
+| `GARMIN_PERSONAL_API_KEY` | — | Personal API key from [Connect settings](https://connect.garmin.com/app/settings/personalApiToken) — enables the official backend |
+| `GARMIN_PERSONAL_TOKEN_CACHE` | `~/.garminconnect/personal_api_token.json` | Where the 24 h bearer token is cached (mode `0600`) |
+| `GARMIN_PERSONAL_BASE_URL` | `https://personal.connectapi.garmin.com` | Personal API host override |
+| `GARMIN_PERSONAL_TIMEOUT_SECONDS` | `20` | HTTP timeout for Personal API calls |
+| `GARMIN_EMAIL` | — | Garmin Connect account email (unofficial backend only) |
+| `GARMIN_PASSWORD` | — | Garmin Connect password (unofficial backend only) |
 | `GARMIN_TOKEN_STORE` | `~/.garminconnect` | Directory for the OAuth token cache |
 | `GARMIN_CACHE_TTL_SECONDS` | `120` | TTL for cached Garmin endpoint responses |
-| `GARMIN_MAX_CONCURRENCY` | `6` | Global cap on in-flight Garmin requests |
+| `GARMIN_MAX_CONCURRENCY` | `3` | Global cap on in-flight Garmin requests |
+| `AIR_QUALITY_ENABLED` | `1` | `0` turns off `get_running_air_quality` (no location ever sent) |
+| `AIR_QUALITY_GRID_DEG` | `0.01` | Grid (degrees) that run start points are rounded to before the air-quality lookup |
+| `GARMIN_LOGIN_COOLDOWN_SECONDS` | `900` | After a failed email/password login, tool calls stop trying to log in for this long (shared by every server process via `login_cooldown.json` in the token store); `0` disables |
+| `GARMIN_DEVICE` | `samsung/SM-S928B/samsung; Android/35` | Phone in the `X-Garmin-User-Agent` header (`maker/model/brand; Android/API level`); set it to your own phone |
+| `GARMIN_APP_VERSION` | `5.30.1` | Garmin Connect Android app version sent in the native API `User-Agent` headers |
+| `GARMIN_MAX_DAYS_HEALTH` | `30` | Max lookback for `get_sleep` / `get_resting_heart_rate` / `get_stress` / `get_health_summary` |
+| `GARMIN_MAX_DAYS_ACTIVITIES` | `365` | Max lookback for activities, training load and running summaries |
+| `GARMIN_MAX_ACTIVITY_LIMIT` | `200` | Max activities returned per call (history is paged automatically) |
 | `GARMIN_DEMO` | unset | `1` serves fictional sample data (same as `serve --demo`) |
 
 Provider bridge variables (optional): `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, plus the matching `*_BASE_URL` and `*_MODEL` overrides.
+
+## Field units
+
+Garmin's raw payloads mix units, and some fields are named after a unit that Garmin does not actually use (see issue #3: `recoveryTime` is minutes, not hours). This table is the contract — if you add a field, add its row.
+
+Daily arrays (`daily` on the sleep, stress, RHR, HRV and body-battery tools) are **newest-first** — index 0 is the most recent day. Sort client-side if you need chronological order.
+
+| Field | Unit we expose | Garmin raw | Conversion |
+|---|---|---|---|
+| `duration` | `"h:mm:ss"` | `duration` (seconds) | formatted |
+| `duration_min`, `duration_seconds` | minutes / seconds | `duration` (seconds) | `/60` |
+| `distance_km`, `total_km`, `total_distance_km` | kilometres | `distance` (metres) | `/1000` |
+| `pace_min_km`, `pace_seconds_per_km` | `"m:ss"` / s per km | `averageSpeed` (m/s) | derived |
+| `hr_avg`, `hr_max`, `avg_hr`, `min_bpm`, `max_bpm`, `latest_bpm`, `*_avg_bpm` | bpm | `averageHR`, `maxHR`, `restingHeartRate` | – |
+| `cadence_spm`, `avg_cadence` | steps per minute | `averageRunningCadenceInStepsPerMinute` | – |
+| `avg_power_w`, `normalized_power_w`, `cycling_ftp_w` | watts | `avgPower`, `normPower`, `functionalThresholdPower` | – |
+| `elevation_gain_m` | metres | `elevationGain` | assumed metres |
+| `total_strokes` | count | `totalNumberOfStrokes` | – |
+| `hours`, `avg_hours` | hours | `sleepTimeSeconds` (seconds) | `/3600` |
+| `sleep_score`, `score`, `stress_avg`, `max_stress` | 0–100 | `sleepScores.overall`, `avgStressLevel` | – |
+| `rest_minutes`, `low_minutes`, `medium_minutes`, `high_minutes`, `activity_minutes` | minutes | `*StressDuration` (seconds) | `/60` |
+| `total_minutes`, `total_hours`, `total_duration_hours` | minutes / hours | `duration` (seconds) | derived |
+| `last_night_avg_ms`, `weekly_avg_ms`, `hrv_weekly_avg` | milliseconds | `lastNightAvg`, `weeklyAvg`, `hrvWeeklyAverage` | – |
+| `recovery_time_hours` | **hours** | `recoveryTime` (**minutes**) | `/60` (issue #3) |
+| `body_battery_today.charged` | level | `charged` | – |
+| `vo2_max_running`, `vo2_max_cycling` | ml/kg/min | `vo2MaxPreciseValue` | – |
+| `race_predictions.*.seconds` | seconds | `time5K`, `time10K`, … | – |
+| `drift_pct` | percent | computed from laps | – |
+| `records[].value` | **mixed — read `value_unit`** | `value` | see below |
+| `records[].value_unit` | `duration` \| `distance_m` \| `elevation_m` \| `watts` \| `steps` \| `days` | derived from the record label | – |
+
+`recovery_time_hours` is only populated when the watch/account provides Training Readiness — a Forerunner 165, for example, returns no readiness data, so the whole `training_readiness` object is `null`. Other tools that lean on it degrade the same way rather than inventing numbers.
 
 ## How It Stays Fast And Quiet
 
@@ -372,8 +500,12 @@ uv run pytest tests/live
 
 ## Troubleshooting
 
+- **`Garmin login paused until HH:MM`**: an earlier login failed (often a 429/Cloudflare block), so tool calls stop retrying until then. Wait, then run `uv run garmin-mcp login` once.
 - **`Garmin rate-limited the request`** — lower `GARMIN_MAX_CONCURRENCY` (for example to `3`) and retry after a few minutes.
 - **`Garmin authentication failed`** — check `GARMIN_EMAIL`/`GARMIN_PASSWORD`, then run `uv run garmin-mcp login` from a real terminal (MFA prompts need interactive input).
+- **`Garmin rejected the Personal API key`** — keys expire after 30/90/180/365 days. Create a new one at <https://connect.garmin.com/app/settings/personalApiToken>, update `GARMIN_PERSONAL_API_KEY`, then `uv run garmin-mcp personal-api --check`.
+- **`personal api required`** — that tool only exists on the official backend. Set `GARMIN_PERSONAL_API_KEY` and `GARMIN_AUTH_MODE=personal` (or `hybrid`).
+- **A derived metric is `null` on the personal backend** — training status/load, readiness, VO2 Max, race predictions and personal records are not in Garmin's Personal API. Switch to `GARMIN_AUTH_MODE=unofficial` when you need them.
 - **A tool returns `errors`** — the array names the endpoint that failed; the rest of the payload is still valid partial data.
 - **A tool returns empty lists** (for example `get_body_metrics`) — nothing was logged in Garmin Connect for that period.
 - **Today's data looks old** — sync the watch in the Garmin Connect app, wait a minute, and ask again; `get_devices` shows when the watch last uploaded.
