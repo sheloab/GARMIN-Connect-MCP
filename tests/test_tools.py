@@ -900,7 +900,14 @@ class FakeHealthGarmin(FakeGarmin):
     def get_hrv_data(self, cdate: str) -> dict[str, Any]:
         # Newest night differs from the oldest, so a wrong pick shows up.
         age = (date.today() - date.fromisoformat(cdate)).days
-        return {"hrvSummary": {"lastNightAvg": [61, 42, 55, 58][age], "weeklyAvg": 54}}
+        return {
+            "hrvSummary": {
+                "lastNightAvg": [61, 42, 55, 58][age],
+                "lastNight5MinHigh": 75,
+                "weeklyAvg": 54,
+                "baseline": {"lowUpper": 44, "balancedLow": 47, "balancedUpper": 60},
+            }
+        }
 
     def get_body_battery(self, start: str, end: str) -> list[dict[str, Any]]:
         # Real response shape: no highest/lowest/end-of-day keys, only the readings.
@@ -1005,3 +1012,19 @@ def test_body_battery_range_prefers_user_summary_levels() -> None:
 
     # The summary is exact; the sparse readings (72/18/30) are only a fallback.
     assert (day["highest"], day["lowest"], day["end_of_day"]) == (81, 9, 27)
+
+
+def test_hrv_history_reports_personal_baseline_and_bands() -> None:
+    _health_manager()
+
+    history = get_hrv_history(days=4)
+
+    assert history["personal_baseline"] == {
+        "balanced_low_ms": 47,
+        "balanced_high_ms": 60,
+        "low_upper_ms": 44,
+    }
+    assert history["bands"] == {"balanced": "47-60", "unbalanced": "45-46 or >60", "low": "<=44"}
+    assert [d["vs_balanced_range"] for d in history["daily"]] == ["above", "below", "in", "in"]
+    assert history["daily"][0]["last_night_5min_high_ms"] == 75
+    assert history["daily"][0]["weekday"] is not None

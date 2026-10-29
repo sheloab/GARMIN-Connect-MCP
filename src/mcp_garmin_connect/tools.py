@@ -1427,25 +1427,36 @@ def get_hrv_history(
     get_recovery carries only a 7-day HRV window, which is fine for "how am I today"
     but useless for trend questions. This is the same data over a longer range.
     `daily` is newest-first, like every other daily array here.
+
+    `baseline_avg_ms` is the mean of the window. `personal_baseline` is Garmin's own
+    range that the HRV status is judged against, with `bands` as its legend; each
+    night says whether it fell below, in or above the balanced range.
     """
     safe_days = max(1, min(days, MAX_DAYS_HEALTH))
     dates = date_range_iso(safe_days)
     errors: ErrorList = []
     daily = []
+    personal: dict[str, Any] | None = None
     for day, raw in zip(dates, _fetch_days(dates, lambda d: _hrv_day(d, errors)), strict=True):
         summary = raw.get("hrvSummary") if isinstance(raw, dict) else None
         if not isinstance(summary, dict):
             continue
         if summary.get("lastNightAvg") is None and summary.get("weeklyAvg") is None:
             continue
+        if personal is None:
+            personal = _hrv_personal_baseline(summary.get("baseline"))
         daily.append(
             {
                 "date": day,
+                "weekday": _weekday(day),
                 "last_night_avg_ms": summary.get("lastNightAvg"),
+                "last_night_5min_high_ms": summary.get("lastNight5MinHigh"),
                 "weekly_avg_ms": summary.get("weeklyAvg"),
                 "status": summary.get("status"),
             }
         )
+    for entry in daily:
+        entry["vs_balanced_range"] = _hrv_vs_range(entry["last_night_avg_ms"], personal)
 
     values = [
         entry["last_night_avg_ms"]
@@ -1463,9 +1474,44 @@ def get_hrv_history(
         "delta_vs_baseline_ms": round_number(latest - baseline, 1)
         if latest is not None and baseline is not None
         else None,
+        "personal_baseline": personal,
+        "bands": _hrv_bands(personal),
         "daily": daily,
         **_errors_payload(errors),
     }
+
+
+def _hrv_personal_baseline(raw: Any) -> dict[str, Any] | None:
+    """Garmin's personal HRV baseline (newest night): the balanced range and low cut-off."""
+    if not isinstance(raw, dict):
+        return None
+    low, high = raw.get("balancedLow"), raw.get("balancedUpper")
+    if not isinstance(low, (int, float)) or not isinstance(high, (int, float)):
+        return None
+    return {"balanced_low_ms": low, "balanced_high_ms": high, "low_upper_ms": raw.get("lowUpper")}
+
+
+def _hrv_vs_range(value: Any, personal: dict[str, Any] | None) -> str | None:
+    if personal is None or not isinstance(value, (int, float)):
+        return None
+    if value < personal["balanced_low_ms"]:
+        return "below"
+    if value > personal["balanced_high_ms"]:
+        return "above"
+    return "in"
+
+
+def _hrv_bands(personal: dict[str, Any] | None) -> dict[str, str] | None:
+    """Legend for the HRV status, which Garmin applies to the 7-day average."""
+    if personal is None:
+        return None
+    low, high = personal["balanced_low_ms"], personal["balanced_high_ms"]
+    bands = {"balanced": f"{low}-{high}", "unbalanced": f"<{low} or >{high}"}
+    low_upper = personal.get("low_upper_ms")
+    if isinstance(low_upper, (int, float)):
+        bands["unbalanced"] = f"{low_upper + 1}-{low - 1} or >{high}"
+        bands["low"] = f"<={low_upper}"
+    return bands
 
 
 def get_body_battery_range(
