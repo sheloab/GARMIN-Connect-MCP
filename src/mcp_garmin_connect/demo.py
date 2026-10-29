@@ -155,9 +155,14 @@ class DemoGarmin:
                     "date": f"{current.isoformat()}T00:00:00.000",
                     "charged": 62,
                     "drained": 49,
-                    "highestBatteryLevel": 86,
-                    "lowestBatteryLevel": 21,
-                    "endOfDayBatteryLevel": 37,
+                    # Real shape: levels only exist as [timestamp_ms, level] pairs.
+                    "bodyBatteryValuesArray": [
+                        [1767225600000, 24],
+                        [1767250800000, 86],
+                        [1767279600000, 21],
+                        [1767308400000, 37],
+                    ],
+                    "endOfDayBodyBatteryDynamicFeedbackEvent": {"bodyBatteryLevel": "LOW"},
                 }
             )
             current += timedelta(days=1)

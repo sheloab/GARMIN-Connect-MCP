@@ -202,6 +202,28 @@ def _body_battery(start: str, end: str, errors: ErrorList | None = None) -> Any:
     )
 
 
+def _body_battery_levels(item: dict[str, Any]) -> dict[str, Any]:
+    """Highest/lowest/end-of-day level for one body battery report day.
+
+    Garmin has no summary fields for these (verified 2026-10-29): the levels live only
+    in bodyBatteryValuesArray as [timestamp_ms, level]. The end-of-day feedback event
+    carries a label ("HIGH", "VERY_LOW"), not a number, so it is not used. The flat
+    keys are kept as a fallback.
+    """
+    levels = [
+        level
+        for _, level in _pairs(item.get("bodyBatteryValuesArray"))
+        if isinstance(level, (int, float))
+    ]
+    if not levels:
+        return {
+            "highest": item.get("highestBatteryLevel"),
+            "lowest": item.get("lowestBatteryLevel"),
+            "end_of_day": item.get("endOfDayBatteryLevel"),
+        }
+    return {"highest": max(levels), "lowest": min(levels), "end_of_day": levels[-1]}
+
+
 def _max_metrics(day: str, errors: ErrorList | None = None) -> Any:
     client = _client()
     return _endpoint(
@@ -471,9 +493,7 @@ def get_recovery() -> dict[str, Any]:
         body_battery = {
             "charged": latest.get("charged"),
             "drained": latest.get("drained"),
-            "highest": latest.get("highestBatteryLevel") or latest.get("highest"),
-            "lowest": latest.get("lowestBatteryLevel") or latest.get("lowest"),
-            "end_of_day": latest.get("endOfDayBatteryLevel"),
+            **_body_battery_levels(latest),
         }
 
     resting_heart_rate = _extract_resting_heart_rate_bpm(rhr_raw)
@@ -1352,7 +1372,8 @@ def get_hrv_history(
         if isinstance(entry.get("last_night_avg_ms"), (int, float))
     ]
     baseline = round_number(sum(values) / len(values), 1) if values else None
-    latest = values[-1] if values else None
+    # daily is newest-first, so the latest night is the first value.
+    latest = values[0] if values else None
     return {
         "period_days": safe_days,
         "days_with_data": len(daily),
@@ -1397,9 +1418,7 @@ def get_body_battery_range(
                     "date": day,
                     "charged": item.get("charged"),
                     "drained": item.get("drained"),
-                    "highest": item.get("highestBatteryLevel") or item.get("highest"),
-                    "lowest": item.get("lowestBatteryLevel") or item.get("lowest"),
-                    "end_of_day": item.get("endOfDayBatteryLevel"),
+                    **_body_battery_levels(item),
                 }
             )
     # Match the rest of the tools: daily arrays are newest-first.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 import pytest
@@ -14,7 +15,9 @@ from mcp_garmin_connect.tools import (
     get_activity_segments,
     get_activity_splits,
     get_body_battery,
+    get_body_battery_range,
     get_daily_activity,
+    get_hrv_history,
     get_monthly_running_stats,
     get_performance_metrics,
     get_personal_records,
@@ -889,3 +892,56 @@ def test_safe_call_maps_auth_errors() -> None:
 
     with pytest.raises(GarminAuthError):
         manager.safe_call(lambda: (_ for _ in ()).throw(GarminConnectAuthenticationError()))
+
+
+class FakeHealthGarmin(FakeGarmin):
+    def get_hrv_data(self, cdate: str) -> dict[str, Any]:
+        # Newest night differs from the oldest, so a wrong pick shows up.
+        age = (date.today() - date.fromisoformat(cdate)).days
+        return {"hrvSummary": {"lastNightAvg": [61, 42, 55, 58][age], "weeklyAvg": 54}}
+
+    def get_body_battery(self, start: str, end: str) -> list[dict[str, Any]]:
+        # Real response shape: no highest/lowest/end-of-day keys, only the readings.
+        return [
+            {
+                "date": end,
+                "charged": 54,
+                "drained": 42,
+                "bodyBatteryValuesArray": [
+                    [1767225600000, 18],
+                    [1767254400000, 72],
+                    [1767268800000, None],
+                    [1767297600000, 30],
+                ],
+                "endOfDayBodyBatteryDynamicFeedbackEvent": {"bodyBatteryLevel": "VERY_LOW"},
+            }
+        ]
+
+
+def _health_manager() -> FakeManager:
+    import mcp_garmin_connect.garmin_client as garmin_client
+
+    manager = FakeManager()
+    manager._client = FakeHealthGarmin()
+    garmin_client._manager = manager
+    return manager
+
+
+def test_hrv_history_latest_is_newest_night() -> None:
+    _health_manager()
+
+    history = get_hrv_history(days=4)
+
+    assert history["daily"][0]["last_night_avg_ms"] == 61
+    assert history["latest_ms"] == 61
+    assert history["delta_vs_baseline_ms"] == round(61 - 54.0, 1)
+
+
+def test_body_battery_range_reads_levels_from_values_array() -> None:
+    _health_manager()
+
+    day = get_body_battery_range(days=1)["daily"][0]
+
+    assert day["highest"] == 72
+    assert day["lowest"] == 18
+    assert day["end_of_day"] == 30
