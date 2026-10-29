@@ -11,6 +11,7 @@ from mcp_garmin_connect.garmin_client import GarminClientManager, reset_manager
 from mcp_garmin_connect.tools import (
     TOOL_SPECS,
     _hr_drift,
+    _stress_band,
     get_activity_distance_splits,
     get_activity_segments,
     get_activity_splits,
@@ -28,6 +29,7 @@ from mcp_garmin_connect.tools import (
     get_running_tolerance,
     get_sleep,
     get_sleep_detail,
+    get_stress,
     get_training_readiness_history,
     get_workout_detail,
     get_yearly_totals,
@@ -918,11 +920,31 @@ class FakeHealthGarmin(FakeGarmin):
         ]
 
 
-def _health_manager() -> FakeManager:
+class FakeStressGarmin(FakeHealthGarmin):
+    def get_all_day_stress(self, cdate: str) -> dict[str, Any]:
+        # Real dailyStress shape: averages and readings, no duration fields.
+        return {
+            "calendarDate": cdate,
+            "avgStressLevel": 34,
+            "maxStressLevel": 88,
+            "stressValuesArray": [[1767225600000, 20], [1767225780000, -2]],
+        }
+
+    def get_user_summary(self, cdate: str) -> dict[str, Any]:
+        return {
+            "restStressDuration": 27000,
+            "lowStressDuration": 21600,
+            "mediumStressDuration": 10800,
+            "highStressDuration": 1500,
+            "activityStressDuration": 5400,
+        }
+
+
+def _health_manager(client: FakeGarmin | None = None) -> FakeManager:
     import mcp_garmin_connect.garmin_client as garmin_client
 
     manager = FakeManager()
-    manager._client = FakeHealthGarmin()
+    manager._client = client or FakeHealthGarmin()
     garmin_client._manager = manager
     return manager
 
@@ -945,3 +967,29 @@ def test_body_battery_range_reads_levels_from_values_array() -> None:
     assert day["highest"] == 72
     assert day["lowest"] == 18
     assert day["end_of_day"] == 30
+
+
+def test_stress_durations_fall_back_to_user_summary() -> None:
+    _health_manager(FakeStressGarmin())
+
+    result = get_stress(days=1)
+    day = result["daily"][0]
+
+    assert day["stress_avg"] == 34
+    assert day["stress_avg_band"] == "low"
+    assert day["weekday"] is not None
+    assert day["rest_minutes"] == 450
+    assert day["activity_minutes"] == 90
+    assert day["durations"]["rest"] == "7h 30m"
+    assert day["durations"]["high"] == "0h 25m"
+    assert result["bands"] == {"rest": "0-25", "low": "26-50", "medium": "51-75", "high": "76-100"}
+    assert "errors" not in result
+
+
+@pytest.mark.parametrize(
+    ("value", "band"),
+    [(0, "rest"), (25, "rest"), (25.5, "low"), (50, "low"), (51, "medium"), (76, "high"),
+     (100, "high"), (-1, None), (None, None)],
+)
+def test_stress_band(value: Any, band: str | None) -> None:
+    assert _stress_band(value) == band

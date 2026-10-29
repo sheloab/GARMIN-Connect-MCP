@@ -613,30 +613,90 @@ def get_stress(
         int, Field(ge=1, le=MAX_DAYS_HEALTH, description="Lookback window in days.")
     ] = 7,
 ) -> dict[str, Any]:
-    """Daily all-day stress levels and stress duration buckets."""
+    """Daily all-day stress levels and stress duration buckets.
+
+    Each day carries the weekday, the band of its average, and the time in each band
+    both in minutes and as "7h 42m". `bands` is the legend of the score ranges.
+    """
     dates = date_range_iso(days)
     errors: ErrorList = []
     daily = []
     for day, raw in zip(dates, _fetch_days(dates, lambda d: _stress_day(d, errors)), strict=True):
+        durations = _stress_durations(day, raw, errors)
+        minutes = {
+            key: round_number((durations.get(field) or 0) / 60, 1)
+            for key, field in _STRESS_DURATION_FIELDS.items()
+        }
+        stress_avg = raw.get("avgStressLevel") or raw.get("overallStressLevel")
         daily.append(
             {
                 "date": day,
-                "stress_avg": raw.get("avgStressLevel") or raw.get("overallStressLevel"),
+                "weekday": _weekday(day),
+                "stress_avg": stress_avg,
+                "stress_avg_band": _stress_band(stress_avg),
                 "max_stress": raw.get("maxStressLevel"),
-                "rest_minutes": round_number((raw.get("restStressDuration") or 0) / 60, 1),
-                "low_minutes": round_number((raw.get("lowStressDuration") or 0) / 60, 1),
-                "medium_minutes": round_number((raw.get("mediumStressDuration") or 0) / 60, 1),
-                "high_minutes": round_number((raw.get("highStressDuration") or 0) / 60, 1),
-                "activity_minutes": round_number((raw.get("activityStressDuration") or 0) / 60, 1),
+                **{f"{key}_minutes": value for key, value in minutes.items()},
+                "durations": {key: _hm(value) for key, value in minutes.items()},
             }
         )
     valid = [d["stress_avg"] for d in daily if isinstance(d.get("stress_avg"), (int, float))]
+    period_avg = round_number(sum(valid) / len(valid), 1) if valid else None
     return {
         "period_days": len(dates),
-        "period_avg_stress": round_number(sum(valid) / len(valid), 1) if valid else None,
+        "period_start": dates[-1],
+        "period_end": dates[0],
+        "period_avg_stress": period_avg,
+        "period_avg_band": _stress_band(period_avg),
+        "bands": {name: f"{low}-{high}" for name, (low, high) in STRESS_BANDS.items()},
         "daily": daily,
         **_errors_payload(errors),
     }
+
+
+# Garmin's stress score bands (0-100). Activity time has no score.
+STRESS_BANDS = {"rest": (0, 25), "low": (26, 50), "medium": (51, 75), "high": (76, 100)}
+
+_STRESS_DURATION_FIELDS = {
+    "rest": "restStressDuration",
+    "low": "lowStressDuration",
+    "medium": "mediumStressDuration",
+    "high": "highStressDuration",
+    "activity": "activityStressDuration",
+}
+
+
+def _stress_durations(day: str, raw: dict[str, Any], errors: ErrorList) -> dict[str, Any]:
+    """Seconds per stress band for one day.
+
+    The dailyStress endpoint only carries the readings, not the durations (verified
+    2026-10-29); Garmin's own totals are in the daily user summary, so fall back to it.
+    """
+    if any(raw.get(field) is not None for field in _STRESS_DURATION_FIELDS.values()):
+        return raw
+    return _user_summary_day(day, errors)
+
+
+def _stress_band(value: Any) -> str | None:
+    if not isinstance(value, (int, float)) or value < 0:
+        return None
+    for name, (_, high) in STRESS_BANDS.items():
+        if value <= high:
+            return name
+    return "high"
+
+
+def _hm(minutes: Any) -> str | None:
+    if not isinstance(minutes, (int, float)) or minutes < 0:
+        return None
+    hours, mins = divmod(int(round(minutes)), 60)
+    return f"{hours}h {mins:02d}m"
+
+
+def _weekday(day: str) -> str | None:
+    try:
+        return datetime.fromisoformat(day).strftime("%a")
+    except ValueError:
+        return None
 
 
 def _fetch_recent_activities(
