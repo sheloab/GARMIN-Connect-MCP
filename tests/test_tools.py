@@ -937,6 +937,9 @@ class FakeStressGarmin(FakeHealthGarmin):
             "mediumStressDuration": 10800,
             "highStressDuration": 1500,
             "activityStressDuration": 5400,
+            "bodyBatteryHighestValue": 81,
+            "bodyBatteryLowestValue": 9,
+            "bodyBatteryMostRecentValue": 27,
         }
 
 
@@ -993,3 +996,12 @@ def test_stress_durations_fall_back_to_user_summary() -> None:
 )
 def test_stress_band(value: Any, band: str | None) -> None:
     assert _stress_band(value) == band
+
+
+def test_body_battery_range_prefers_user_summary_levels() -> None:
+    _health_manager(FakeStressGarmin())
+
+    day = get_body_battery_range(days=1)["daily"][0]
+
+    # The summary is exact; the sparse readings (72/18/30) are only a fallback.
+    assert (day["highest"], day["lowest"], day["end_of_day"]) == (81, 9, 27)
